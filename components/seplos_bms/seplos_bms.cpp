@@ -17,13 +17,87 @@ void SeplosBms::on_seplos_modbus_data(const std::vector<uint8_t> &data) {
   // 14             77           142 (0x8E)
   // 15             79           146 (0x92)
   // 16             81           150 (0x96)
-  if (data.size() >= 44 && data[8] >= 8 && data[8] <= 16) {
+// ZTE FRAME
+if (data[0] == 0x21 && data.size() >= 60) {
+    this->on_zte_telemetry_(data);
+    return;
+}
+
+// SEPLOS FRAME
+if (data.size() >= 44 && data[8] >= 8 && data[8] <= 16) {
     this->on_telemetry_data_(data);
     return;
-  }
+}
 
   ESP_LOGW(TAG, "Unhandled data received (data_len: 0x%02X): %s", data[5],
            format_hex_pretty(&data.front(), data.size()).c_str());
+}
+
+void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
+  ESP_LOGI(TAG, "ZTE FB101 telemetry frame (%d bytes) received", data.size());
+  ESP_LOGVV(TAG, "  %s", format_hex_pretty(&data.front(), data.size()).c_str());
+
+  auto zte_u16 = [&](size_t i) -> uint16_t {
+    return (uint16_t(data[i]) << 8) | uint16_t(data[i+1]);
+  };
+
+  // --------------------
+  // CELL VOLTAGES (15 CELLS) — fixed structure for FB101
+  // starting at byte index 8
+  // --------------------
+  const int CELL_COUNT = 15;
+  for (int i = 0; i < CELL_COUNT; i++) {
+    uint16_t raw = zte_u16(8 + i*2);
+    float voltage = raw / 1000.0f;   // 0x0D2A = 3370 => 3.370V
+    this->publish_state_(this->cells_[i].cell_voltage_sensor_, voltage);
+  }
+
+  // compute stats
+  float min_v = 99, max_v = -99, avg = 0;
+  int min_i = 0, max_i = 0;
+
+  for (int i = 0; i < CELL_COUNT; i++) {
+      float v = this->cells_[i].cell_voltage_sensor_->state;
+      if (v < min_v) { min_v = v; min_i = i+1; }
+      if (v > max_v) { max_v = v; max_i = i+1; }
+      avg += v;
+  }
+  avg /= CELL_COUNT;
+
+  this->publish_state_(this->min_cell_voltage_sensor_, min_v);
+  this->publish_state_(this->max_cell_voltage_sensor_, max_v);
+  this->publish_state_(this->min_voltage_cell_sensor_, min_i);
+  this->publish_state_(this->max_voltage_cell_sensor_, max_i);
+  this->publish_state_(this->delta_cell_voltage_sensor_, max_v - min_v);
+  this->publish_state_(this->average_cell_voltage_sensor_, avg);
+
+  // --------------------
+  // TEMPERATURE SENSORS
+  // byte 38 = number of sensors
+  // byte 39.. = temp1,temp2,temp3 (0.01 C)
+  // --------------------
+  uint8_t tcount = data[38];
+  for (int i = 0; i < tcount && i < 3; i++) {
+      float raw = zte_u16(39 + i*2);
+      float temp = raw / 100.0f;
+      this->publish_state_(this->temperatures_[i].temperature_sensor_, temp);
+  }
+
+  // --------------------
+  // CURRENT, PACK VOLTAGE, SOC
+  // Based on your logs:
+  // current    : NOT confirmed — skip unless needed
+  // voltage    : appears after cell block + temps
+  // SOC        : bytes 52..53 (0.01 %)
+  // --------------------
+
+  // SOC
+  float soc = zte_u16(52) / 100.0f;
+  this->publish_state_(this->state_of_charge_sensor_, soc);
+
+  // total pack voltage (calc from cells)
+  float total_voltage = avg * CELL_COUNT;
+  this->publish_state_(this->total_voltage_sensor_, total_voltage);
 }
 
 void SeplosBms::on_telemetry_data_(const std::vector<uint8_t> &data) {
