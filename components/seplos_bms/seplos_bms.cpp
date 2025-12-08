@@ -94,9 +94,6 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   // SOC        : bytes 52..53 (0.01 %)
   // --------------------
 
-  // SOC
-  float soc = zte_u16(52) / 100.0f;
-  this->publish_state_(this->state_of_charge_sensor_, soc);
 
   // total pack voltage (calc from cells)
   float total_voltage = avg * CELL_COUNT;
