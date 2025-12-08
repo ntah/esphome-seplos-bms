@@ -109,10 +109,23 @@ bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
   uint16_t computed_crc = chksum(raw + 1, data_len);
   uint16_t remote_crc = uint16_t(ascii_hex_to_byte(raw[at - 4], raw[at - 3])) << 8 |
                         (uint16_t(ascii_hex_to_byte(raw[at - 2], raw[at - 1])) << 0);
-  if (computed_crc != remote_crc) {
-    ESP_LOGW(TAG, "CRC check failed! 0x%04X != 0x%04X", computed_crc, remote_crc);
-    return false;
-  }
+// ---------------------------------------------------------------------
+// ZTE FB101 patch:
+// ZTE frames start with "~21..." and DO NOT use Modbus CRC.
+// Skip CRC check if frame type = 0x21 (ASCII '2''1')
+// ---------------------------------------------------------------------
+if (computed_crc != remote_crc) {
+
+    // Detect ZTE frame (~21xxxx....)
+    if (raw.size() > 4 && raw[1] == '2' && raw[2] == '1') {
+        ESP_LOGW(TAG, "CRC mismatch but accepting as ZTE FB101 frame");
+        // Do NOT return false. Just continue.
+    } else {
+        ESP_LOGW(TAG, "CRC check failed! 0x%04X != 0x%04X", computed_crc, remote_crc);
+        return false;   // keep rejecting real Seplos CRC errors
+    }
+}
+// ---------------------------------------------------------------------
 
   std::vector<uint8_t> data;
   for (uint16_t i = 1; i < data_len; i = i + 2) {
