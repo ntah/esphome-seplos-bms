@@ -95,33 +95,32 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   // --------------------
 
 
-  // total pack voltage (calc from cells)
-  float total_voltage = avg * CELL_COUNT;
-  this->publish_state_(this->total_voltage_sensor_, total_voltage);
-  
-  // SOH (~97%)
-  float soh = zte_u16(47) / 52.0f;
-  this->publish_state_(this->state_of_health_sensor_, soh);
-
-  // Full capacity (~97-103 Ah tergantung internal BMS)
-  float full_cap = zte_u16(53) / 100.0f;
-  this->publish_state_(this->battery_capacity_sensor_, full_cap);
-
-  // SOC dari field khusus (0x2328 = 9000 = 90.00 %)
-  float soc = zte_u16(52) / 100.0f;
-  this->publish_state_(this->state_of_charge_sensor_, soc);
-
-  // Residual capacity: turunan dari SOC × FullCap
-  float rem_cap = (full_cap > 0.0f) ? (full_cap * soc / 100.0f) : 0.0f;
-  this->publish_state_(this->residual_capacity_sensor_, rem_cap);
-  
-  // CURRENT LIVE (word 45-46)
+  // ---------- CURRENT (F1: 45-46) ----------
   int16_t cur_raw = (int16_t) zte_u16(45);
-  // skala 0.01 A → 00B1 = 177 → 1.77 A
-  float current = cur_raw / 100.0f;
+  float current = cur_raw / 100.0f;     // 00B1 = 177 → 1.77 A
   this->publish_state_(this->current_sensor_, current);
 
-  // POWER
+  // ---------- FULL CAPACITY & SOH ----------
+  // F2 (47-48) tampaknya berhubungan dengan kapasitas / SOH.
+  // Kita pakai scaling supaya SOH mendekati 97% (sesuai alat lain).
+  uint16_t cap_raw = zte_u16(47);       // 0x1405 = 5125
+  // konstanta empiris dari 5125 / 97.05 ≈ 52.8
+  float full_cap = cap_raw / 52.8f;     // ≈ 97.0 Ah
+  this->publish_state_(this->battery_capacity_sensor_, full_cap);
+
+  // Karena nominal pack = 100 Ah, kita treat full_cap (Ah) = SOH (%)
+  float soh = full_cap;                 // ≈ 97 %
+  this->publish_state_(this->state_of_health_sensor_, soh);
+
+  // ---------- SOC (pakai field khusus yang sudah kita tahu benar) ----------
+  float soc = zte_u16(52) / 100.0f;     // 0x2328 = 9000 → 90.00 %
+  this->publish_state_(this->state_of_charge_sensor_, soc);
+
+  // ---------- RESIDUAL CAPACITY (turunan SOC × full_cap) ----------
+  float rem_cap = (full_cap > 0.0f) ? (full_cap * soc / 100.0f) : 0.0f;
+  this->publish_state_(this->residual_capacity_sensor_, rem_cap);
+
+  // ---------- POWER ----------
   float total_v = this->total_voltage_sensor_->state;
   float power = total_v * current;
   this->publish_state_(this->power_sensor_, power);
@@ -134,8 +133,8 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
     this->publish_state_(this->discharging_power_sensor_, -power);
   }
 
-  // CYCLES
-  float cycles = zte_u16(55) / 202.0f;
+  // ---------- CYCLES (F6) ----------
+  float cycles = zte_u16(55) / 202.0f;  // scaling empiris → ~295
   this->publish_state_(this->charging_cycles_sensor_, cycles);
 }
 
