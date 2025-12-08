@@ -98,35 +98,61 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   // total pack voltage (calc from cells)
   float total_voltage = avg * CELL_COUNT;
   this->publish_state_(this->total_voltage_sensor_, total_voltage);
-  // SOH (approx 97%)
+  
+  // ---------------------
+  // SOH (~97%)
+  // ---------------------
   float soh = zte_u16(47) / 52.0f;
   this->publish_state_(this->state_of_health_sensor_, soh);
 
-  // Full capacity (should be ~97Ah)
+  // ---------------------
+  // Full capacity (~97 Ah)
+  // ---------------------
   float full_cap = zte_u16(53) / 100.0f;
   this->publish_state_(this->battery_capacity_sensor_, full_cap);
 
-  // Remaining capacity (~87Ah)
-  int16_t rem_raw = (int16_t)zte_u16(51);
+  // ---------------------
+  // Remaining capacity (~87 Ah) - pakai signed & faktor -375
+  // ---------------------
+  int16_t rem_raw = (int16_t) zte_u16(51);
   float rem_cap = rem_raw / -375.0f;
   this->publish_state_(this->residual_capacity_sensor_, rem_cap);
 
-  // SOC derived
-  float soc = (full_cap > 0) ? (rem_cap / full_cap * 100.0f) : 0;
+  // ---------------------
+  // SOC dihitung dari rem_cap / full_cap
+  // ---------------------
+  float soc = (full_cap > 0.0f) ? (rem_cap / full_cap * 100.0f) : 0.0f;
   this->publish_state_(this->state_of_charge_sensor_, soc);
 
-  // Cycle count (~295)
-  float cycles = zte_u16(55) / 202.0f;
-  this->publish_state_(this->charging_cycles_sensor_, cycles);
-
-  // Current (A)
-  float current = zte_u16(49) / 10.0f;
+  // ---------------------
+  // CURRENT LIVE (F1: index 45–46)
+  // ---------------------
+  int16_t cur_raw = (int16_t) zte_u16(45);
+  // skala awal: 0.01 A (200 → 2.00 A, 0 → 0 A)
+  float current = cur_raw / 100.0f;
   this->publish_state_(this->current_sensor_, current);
-
-  // Power
+  
+  // ---------------------
+  // POWER
+  // ---------------------
   float total_v = this->total_voltage_sensor_->state;
   float power = total_v * current;
   this->publish_state_(this->power_sensor_, power);
+
+  if (current > 0.0f) {
+    // misal definisi: current > 0 = charging
+    this->publish_state_(this->charging_power_sensor_, power);
+    this->publish_state_(this->discharging_power_sensor_, 0.0f);
+  } else {
+    // current < 0 = discharging
+    this->publish_state_(this->charging_power_sensor_, 0.0f);
+    this->publish_state_(this->discharging_power_sensor_, -power);
+  }
+  // ---------------------
+  // CYCLE COUNT (pakai sensor yang sudah ada: charging_cycles_sensor_)
+  // ---------------------
+  float cycles = zte_u16(55) / 202.0f;  // scaling yang cocok dengan ~295
+  this->publish_state_(this->charging_cycles_sensor_, cycles);
 }
 
 void SeplosBms::on_telemetry_data_(const std::vector<uint8_t> &data) {
