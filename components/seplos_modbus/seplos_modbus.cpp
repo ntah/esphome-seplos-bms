@@ -116,11 +116,10 @@ bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
 // ---------------------------------------------------------------------
 if (computed_crc != remote_crc) {
 
-    // raw_[1] and raw_[2] contain ASCII hex of frame type:
-    // "~21" = ZTE, "~20" = Seplos
-    if (this->raw_len_ >= 3 && this->raw_[1] == '2' && this->raw_[2] == '1') {
+    // Ensure enough bytes exist before checking
+    if (at >= 2 && raw[1] == '2' && raw[2] == '1') {
         ESP_LOGW(TAG, "CRC mismatch but accepting as ZTE FB101 frame");
-        // DO NOT return false → accept frame
+        // Accept frame and continue
     } else {
         ESP_LOGW(TAG, "CRC check failed! 0x%04X != 0x%04X", computed_crc, remote_crc);
         return false;
