@@ -94,11 +94,27 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   // SOC        : bytes 52..53 (0.01 %)
   // --------------------
 
-
-  // ---------- CURRENT (F1: 45-46) ----------
+  // CURRENT dari F1
   int16_t cur_raw = (int16_t) zte_u16(45);
-  float current = cur_raw / 100.0f;     // 00B1 = 177 → 1.77 A
+  float current = cur_raw / 120.0f;  // atau /100.0f kalau mau tetap versi lama
   this->publish_state_(this->current_sensor_, current);
+
+  // POWER – pakai total_voltage yang barusan kita publish
+  float total_v = this->total_voltage_sensor_->state;
+  if (std::isnan(total_v)) {
+    total_v = total_voltage; // fallback ke variabel lokal tadi
+  }
+
+  float power = total_v * current;
+  this->publish_state_(this->power_sensor_, power);
+
+  if (current > 0.0f) {
+    this->publish_state_(this->charging_power_sensor_, power);
+    this->publish_state_(this->discharging_power_sensor_, 0.0f);
+  } else {
+    this->publish_state_(this->charging_power_sensor_, 0.0f);
+    this->publish_state_(this->discharging_power_sensor_, -power);
+  }
 
   // ---------- FULL CAPACITY & SOH ----------
   // F2 (47-48) tampaknya berhubungan dengan kapasitas / SOH.
@@ -119,19 +135,6 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   // ---------- RESIDUAL CAPACITY (turunan SOC × full_cap) ----------
   float rem_cap = (full_cap > 0.0f) ? (full_cap * soc / 100.0f) : 0.0f;
   this->publish_state_(this->residual_capacity_sensor_, rem_cap);
-
-  // ---------- POWER ----------
-  float total_v = this->total_voltage_sensor_->state;
-  float power = total_v * current;
-  this->publish_state_(this->power_sensor_, power);
-
-  if (current > 0.0f) {
-    this->publish_state_(this->charging_power_sensor_, power);
-    this->publish_state_(this->discharging_power_sensor_, 0.0f);
-  } else {
-    this->publish_state_(this->charging_power_sensor_, 0.0f);
-    this->publish_state_(this->discharging_power_sensor_, -power);
-  }
 
   // ---------- CYCLES (F6) ----------
   float cycles = zte_u16(55) / 202.0f;  // scaling empiris → ~295
