@@ -117,7 +117,7 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
 
   // Cycle count (~295)
   float cycles = zte_u16(55) / 202.0f;
-  this->publish_state_(this->battery_cycle_sensor_, cycles);
+  this->publish_state_(this->charging_cycles_sensor_, cycles);
 
   // Current (A)
   float current = zte_u16(49) / 10.0f;
