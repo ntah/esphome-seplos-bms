@@ -40,104 +40,135 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   ESP_LOGI(TAG, "ZTE FB101 telemetry frame (%d bytes) received", data.size());
   ESP_LOGVV(TAG, "  %s", format_hex_pretty(&data.front(), data.size()).c_str());
 
+  if (data.size() < 58) {
+    // frame terlalu pendek, abaikan
+    return;
+  }
+
   auto zte_u16 = [&](size_t i) -> uint16_t {
-    return (uint16_t(data[i]) << 8) | uint16_t(data[i+1]);
+    if (i + 1 >= data.size()) {
+      return 0;
+    }
+    return (uint16_t(data[i]) << 8) | uint16_t(data[i + 1]);
   };
 
   // --------------------
-  // CELL VOLTAGES (15 CELLS) — fixed structure for FB101
-  // starting at byte index 8
+  // CELL VOLTAGES (15 cell) mulai index 8
   // --------------------
   const int CELL_COUNT = 15;
-  for (int i = 0; i < CELL_COUNT; i++) {
-    uint16_t raw = zte_u16(8 + i*2);
-    float voltage = raw / 1000.0f;   // 0x0D2A = 3370 => 3.370V
-    this->publish_state_(this->cells_[i].cell_voltage_sensor_, voltage);
-  }
-
-  // compute stats
-  float min_v = 99, max_v = -99, avg = 0;
-  int min_i = 0, max_i = 0;
+  float min_v = 100.0f;
+  float max_v = -100.0f;
+  float sum_v = 0.0f;
+  int min_i = 0;
+  int max_i = 0;
 
   for (int i = 0; i < CELL_COUNT; i++) {
-      float v = this->cells_[i].cell_voltage_sensor_->state;
-      if (v < min_v) { min_v = v; min_i = i+1; }
-      if (v > max_v) { max_v = v; max_i = i+1; }
-      avg += v;
+    size_t idx = 8 + i * 2;
+    if (idx + 1 >= data.size())
+      break;
+
+    uint16_t raw = zte_u16(idx);           // misal 3374 → 0x0D2E
+    float voltage = raw / 1000.0f;         // 3374 → 3.374 V
+
+    // publish ke sensor cell
+    if (i < 16) { // cells_ biasanya di-declare 16 elemen
+      this->publish_state_(this->cells_[i].cell_voltage_sensor_, voltage);
+    }
+
+    // statistik
+    sum_v += voltage;
+    if (voltage < min_v) {
+      min_v = voltage;
+      min_i = i + 1;
+    }
+    if (voltage > max_v) {
+      max_v = voltage;
+      max_i = i + 1;
+    }
   }
-  avg /= CELL_COUNT;
+
+  float avg = sum_v / CELL_COUNT;
+  float total_v = sum_v;  // total tegangan pack
 
   this->publish_state_(this->min_cell_voltage_sensor_, min_v);
   this->publish_state_(this->max_cell_voltage_sensor_, max_v);
-  this->publish_state_(this->min_voltage_cell_sensor_, min_i);
-  this->publish_state_(this->max_voltage_cell_sensor_, max_i);
+  this->publish_state_(this->min_voltage_cell_sensor_, (float) min_i);
+  this->publish_state_(this->max_voltage_cell_sensor_, (float) max_i);
   this->publish_state_(this->delta_cell_voltage_sensor_, max_v - min_v);
   this->publish_state_(this->average_cell_voltage_sensor_, avg);
 
+  // total voltage → dari jumlah cell
+  this->publish_state_(this->total_voltage_sensor_, total_v);
+
   // --------------------
-  // TEMPERATURE SENSORS
-  // byte 38 = number of sensors
-  // byte 39.. = temp1,temp2,temp3 (0.01 C)
+  // TEMPERATUR
+  // index 38 = jumlah sensor, 39.. = temp1,2,3 (0.01 °C)
   // --------------------
-  uint8_t tcount = data[38];
-  for (int i = 0; i < tcount && i < 3; i++) {
-      float raw = zte_u16(39 + i*2);
-      float temp = raw / 100.0f;
-      this->publish_state_(this->temperatures_[i].temperature_sensor_, temp);
+  if (data.size() > 39) {
+    uint8_t tcount = data[38];
+    for (int t = 0; t < tcount && t < 3; t++) {
+      size_t tidx = 39 + t * 2;
+      if (tidx + 1 >= data.size())
+        break;
+
+      float raw_t = (float) zte_u16(tidx);
+      float temp = raw_t / 100.0f;  // 3000 → 30.00 °C
+      this->publish_state_(this->temperatures_[t].temperature_sensor_, temp);
+    }
   }
 
   // --------------------
-  // CURRENT, PACK VOLTAGE, SOC
-  // Based on your logs:
-  // current    : NOT confirmed — skip unless needed
-  // voltage    : appears after cell block + temps
-  // SOC        : bytes 52..53 (0.01 %)
+  // CURRENT dari F1 (index 45–46)
   // --------------------
-
-  // CURRENT dari F1
   int16_t cur_raw = (int16_t) zte_u16(45);
-  float current = cur_raw / 120.0f;  // atau /100.0f kalau mau tetap versi lama
+  // dari data kamu: 0xFFED = -19 → -0.19 A (idle), 0x0019 = 25 → 0.25 A, dsb
+  float current = cur_raw / 100.0f;
   this->publish_state_(this->current_sensor_, current);
 
-  // POWER – pakai total_voltage yang barusan kita publish
-  float total_v = this->total_voltage_sensor_->state;
-  if (std::isnan(total_v)) {
-    total_v = total_voltage; // fallback ke variabel lokal tadi
-  }
+  // --------------------
+  // FULL CAPACITY & SOH (F2)
+  // --------------------
+  uint16_t cap_raw = zte_u16(47);      // contoh: 0x1405 = 5125
+  // konstanta empiris: 5125 / 97.05 ≈ 52.8
+  float full_cap = cap_raw / 52.8f;    // ≈ 97 Ah untuk pack kamu
+  this->publish_state_(this->battery_capacity_sensor_, full_cap);
 
+  // treat full_cap (Ah) sebagai SOH (% dari nominal 100 Ah)
+  float soh = full_cap;
+  this->publish_state_(this->state_of_health_sensor_, soh);
+
+  // --------------------
+  // SOC (F5, index 52–53, 0.01 %)
+  // --------------------
+  float soc = zte_u16(52) / 100.0f;    // 0x2328 = 9000 → 90.00 %
+  this->publish_state_(this->state_of_charge_sensor_, soc);
+
+  // --------------------
+  // RESIDUAL CAPACITY (turunan SOC × full_cap)
+  // --------------------
+  float rem_cap = (full_cap > 0.0f) ? (full_cap * soc / 100.0f) : 0.0f;
+  this->publish_state_(this->residual_capacity_sensor_, rem_cap);
+
+  // --------------------
+  // POWER = V × I
+  // --------------------
   float power = total_v * current;
   this->publish_state_(this->power_sensor_, power);
 
   if (current > 0.0f) {
+    // charging
     this->publish_state_(this->charging_power_sensor_, power);
     this->publish_state_(this->discharging_power_sensor_, 0.0f);
   } else {
+    // discharging atau idle
     this->publish_state_(this->charging_power_sensor_, 0.0f);
     this->publish_state_(this->discharging_power_sensor_, -power);
   }
 
-  // ---------- FULL CAPACITY & SOH ----------
-  // F2 (47-48) tampaknya berhubungan dengan kapasitas / SOH.
-  // Kita pakai scaling supaya SOH mendekati 97% (sesuai alat lain).
-  uint16_t cap_raw = zte_u16(47);       // 0x1405 = 5125
-  // konstanta empiris dari 5125 / 97.05 ≈ 52.8
-  float full_cap = cap_raw / 52.8f;     // ≈ 97.0 Ah
-  this->publish_state_(this->battery_capacity_sensor_, full_cap);
-
-  // Karena nominal pack = 100 Ah, kita treat full_cap (Ah) = SOH (%)
-  float soh = full_cap;                 // ≈ 97 %
-  this->publish_state_(this->state_of_health_sensor_, soh);
-
-  // ---------- SOC (pakai field khusus yang sudah kita tahu benar) ----------
-  float soc = zte_u16(52) / 100.0f;     // 0x2328 = 9000 → 90.00 %
-  this->publish_state_(this->state_of_charge_sensor_, soc);
-
-  // ---------- RESIDUAL CAPACITY (turunan SOC × full_cap) ----------
-  float rem_cap = (full_cap > 0.0f) ? (full_cap * soc / 100.0f) : 0.0f;
-  this->publish_state_(this->residual_capacity_sensor_, rem_cap);
-
-  // ---------- CYCLES (F6) ----------
-  float cycles = zte_u16(55) / 202.0f;  // scaling empiris → ~295
+  // --------------------
+  // CYCLE COUNT (F6), scaling empiris
+  // --------------------
+  float cycles = zte_u16(55) / 202.0f;  // ≈ 295 atau ≈ 461 sesuai pack
   this->publish_state_(this->charging_cycles_sensor_, cycles);
 }
 
