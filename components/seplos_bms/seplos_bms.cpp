@@ -18,7 +18,10 @@ void SeplosBms::on_seplos_modbus_data(const std::vector<uint8_t> &data) {
   // 15             79           146 (0x92)
   // 16             81           150 (0x96)
 // ZTE FRAME
-if (data[0] == 0x21 && data.size() >= 60) {
+if (data.size() >= 58 
+    && data[0] == 0x21      // protocol header (ASCII '~21' decoded)
+    && data[2] == 0x46      // device type
+    && data[3] == 0x00) {   // ZTE always sends CID2=0x00 here
     this->on_zte_telemetry_(data);
     return;
 }
