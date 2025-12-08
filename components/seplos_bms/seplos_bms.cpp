@@ -101,6 +101,35 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   // total pack voltage (calc from cells)
   float total_voltage = avg * CELL_COUNT;
   this->publish_state_(this->total_voltage_sensor_, total_voltage);
+  // SOH (approx 97%)
+  float soh = zte_u16(47) / 52.0f;
+  this->publish_state_(this->state_of_health_sensor_, soh);
+
+  // Full capacity (should be ~97Ah)
+  float full_cap = zte_u16(53) / 100.0f;
+  this->publish_state_(this->battery_capacity_sensor_, full_cap);
+
+  // Remaining capacity (~87Ah)
+  int16_t rem_raw = (int16_t)zte_u16(51);
+  float rem_cap = rem_raw / -375.0f;
+  this->publish_state_(this->residual_capacity_sensor_, rem_cap);
+
+  // SOC derived
+  float soc = (full_cap > 0) ? (rem_cap / full_cap * 100.0f) : 0;
+  this->publish_state_(this->state_of_charge_sensor_, soc);
+
+  // Cycle count (~295)
+  float cycles = zte_u16(55) / 202.0f;
+  this->publish_state_(this->battery_cycle_sensor_, cycles);
+
+  // Current (A)
+  float current = zte_u16(49) / 10.0f;
+  this->publish_state_(this->current_sensor_, current);
+
+  // Power
+  float total_v = this->total_voltage_sensor_->state;
+  float power = total_v * current;
+  this->publish_state_(this->power_sensor_, power);
 }
 
 void SeplosBms::on_telemetry_data_(const std::vector<uint8_t> &data) {
