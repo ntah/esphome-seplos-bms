@@ -43,18 +43,24 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
     return;
   }
 
+  // ------------------------------------------------------------------
+  // CONFIG: set nominal (rated) capacity here (Ah). Change if your pack
+  // isn't 100 Ah. If you want YAML-configurable, I can add a class field.
+  // ------------------------------------------------------------------
+  const float rated_capacity = 100.0f;
+
   // helper safe read 16-bit big-endian
   auto zte_u16 = [&](size_t i) -> uint16_t {
     if (i + 1 >= data.size()) return 0;
     return (static_cast<uint16_t>(data[i]) << 8) | static_cast<uint16_t>(data[i + 1]);
   };
 
-  // sizes for member C-style arrays
-  const int CELLS_ARRAY_LEN = static_cast<int>(sizeof(this->cells_) / sizeof(this->cells_[0]));      // likely 16
-  const int TEMPS_ARRAY_LEN = static_cast<int>(sizeof(this->temperatures_) / sizeof(this->temperatures_[0])); // likely 6
+  // sizes for member C-style arrays (guard against change in header)
+  const int CELLS_ARRAY_LEN = static_cast<int>(sizeof(this->cells_) / sizeof(this->cells_[0]));
+  const int TEMPS_ARRAY_LEN = static_cast<int>(sizeof(this->temperatures_) / sizeof(this->temperatures_[0]));
 
   // -----------------------
-  // Cells (15 cells, offset 8)
+  // CELLS (15 cells, offset 8, each 2 bytes, raw = mV)
   // -----------------------
   const int CELL_COUNT = 15;
   float sum_v = 0.0f;
@@ -66,9 +72,8 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
     size_t idx = 8 + i * 2;
     if (idx + 1 >= data.size()) break;
     uint16_t raw = zte_u16(idx);
-    float v = raw / 1000.0f; // raw is in mV e.g. 3374 -> 3.374 V
+    float v = raw / 1000.0f; // raw in mV -> V
 
-    // publish cell sensor if available (guard with real array length)
     if (i < CELLS_ARRAY_LEN && this->cells_[i].cell_voltage_sensor_ != nullptr) {
       this->publish_state_(this->cells_[i].cell_voltage_sensor_, v);
     }
@@ -79,9 +84,9 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   }
 
   float avg_v = (CELL_COUNT > 0) ? (sum_v / (float)CELL_COUNT) : 0.0f;
-  float total_v = sum_v; // pack voltage = sum of cell voltages
+  float total_v = sum_v; // pack voltage as sum of cells
 
-  // publish cell statistics (check pointers)
+  // publish cell statistics
   if (this->min_cell_voltage_sensor_ != nullptr) this->publish_state_(this->min_cell_voltage_sensor_, min_v);
   if (this->max_cell_voltage_sensor_ != nullptr) this->publish_state_(this->max_cell_voltage_sensor_, max_v);
   if (this->delta_cell_voltage_sensor_ != nullptr) this->publish_state_(this->delta_cell_voltage_sensor_, (max_v - min_v));
@@ -90,12 +95,10 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   if (max_idx > 0 && this->max_voltage_cell_sensor_ != nullptr) this->publish_state_(this->max_voltage_cell_sensor_, (float)max_idx);
 
   // publish total voltage
-  if (this->total_voltage_sensor_ != nullptr) {
-    this->publish_state_(this->total_voltage_sensor_, total_v);
-  }
+  if (this->total_voltage_sensor_ != nullptr) this->publish_state_(this->total_voltage_sensor_, total_v);
 
   // -----------------------
-  // Temperatures: data[38] = count, data[39..] temperature words (0.01 °C)
+  // TEMPERATURES: data[38] = count, data[39..] = temp words (scaled 0.01 °C)
   // -----------------------
   if (data.size() > 39) {
     uint8_t tcount = data[38];
@@ -103,8 +106,7 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
       size_t tidx = 39 + t * 2;
       if (tidx + 1 >= data.size()) break;
       float t_raw = static_cast<float>(zte_u16(tidx));
-      float t_c = t_raw / 100.0f; // 3000 -> 30.00 °C
-
+      float t_c = t_raw / 100.0f;
       if (t < TEMPS_ARRAY_LEN && this->temperatures_[t].temperature_sensor_ != nullptr) {
         this->publish_state_(this->temperatures_[t].temperature_sensor_, t_c);
       }
@@ -112,48 +114,45 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   }
 
   // -----------------------
-  // Current (word 45-46) - signed
+  // CURRENT (signed int16 from word 45-46). Empiric scale: /100 => Ampere
   // -----------------------
   int16_t cur_raw = static_cast<int16_t>(zte_u16(45));
-  // scale: raw / 100.0 -> Ampere (empiris dari log)
   float current = cur_raw / 100.0f;
   if (this->current_sensor_ != nullptr) this->publish_state_(this->current_sensor_, current);
 
   // -----------------------
-  // Full capacity raw -> full_cap (Ah)
-  // We use empiric decode factor 52.8 (derived from observed pairs raw->Ah)
+  // FULL CAPACITY (raw -> Ah). Use empiric decode factor (52.8) derived
+  // from observed raw->Ah pairs. If you want different decode, tweak factor.
   // -----------------------
   uint16_t cap_raw = zte_u16(47);
-  const float DECODE_CAP_FACTOR = 52.8f; // empiric factor (raw / 52.8 => Ah)
+  const float DECODE_CAP_FACTOR = 52.8f;
   float full_cap = cap_raw / DECODE_CAP_FACTOR;
   if (this->battery_capacity_sensor_ != nullptr) this->publish_state_(this->battery_capacity_sensor_, full_cap);
 
   // -----------------------
-  // SOH calculation (configurable rated_capacity)
-  // By default assume nominal/rated capacity 100.0 Ah for this pack; change if needed.
+  // SOH = full_cap / rated_capacity * 100
+  // (safe guard rated_capacity > 0)
   // -----------------------
-  const float rated_capacity = 100.0f; // <-- edit this value if your pack nominal differs
   float soh = 0.0f;
   if (rated_capacity > 0.0f) soh = (full_cap / rated_capacity) * 100.0f;
   if (this->state_of_health_sensor_ != nullptr) this->publish_state_(this->state_of_health_sensor_, soh);
 
   // -----------------------
-  // SOC (word 52-53) - scale 0.01 %
+  // SOC (word 52-53) - scale 0.01% -> percent
   // -----------------------
   float soc = zte_u16(52) / 100.0f;
   if (this->state_of_charge_sensor_ != nullptr) this->publish_state_(this->state_of_charge_sensor_, soc);
 
   // -----------------------
-  // Residual capacity (Ah) from SOC * full_cap
+  // RESIDUAL CAPACITY (Ah) computed from full_cap * SOC%
   // -----------------------
   float rem_cap = (full_cap > 0.0f) ? (full_cap * (soc / 100.0f)) : 0.0f;
   if (this->residual_capacity_sensor_ != nullptr) this->publish_state_(this->residual_capacity_sensor_, rem_cap);
 
   // -----------------------
-  // Power calculations (use total_v computed above)
+  // POWER calculations (use total_v; fallback to avg_v * CELL_COUNT)
   // -----------------------
   if (!std::isfinite(total_v) || total_v <= 0.0f) total_v = avg_v * (float)CELL_COUNT;
-
   float power = total_v * current;
   if (this->power_sensor_ != nullptr) this->publish_state_(this->power_sensor_, power);
 
@@ -168,9 +167,9 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   }
 
   // -----------------------
-  // Cycle count (word 55-56) - empirical scaling
+  // CYCLE count (word 55-56) - empirical mapping
   // -----------------------
-  float cycles = zte_u16(55) / 202.0f; // empirical mapping; tweak if necessary
+  float cycles = zte_u16(55) / 202.0f; // tweak divisor if you want integer cycles
   if (this->charging_cycles_sensor_ != nullptr) this->publish_state_(this->charging_cycles_sensor_, cycles);
 
   // done
