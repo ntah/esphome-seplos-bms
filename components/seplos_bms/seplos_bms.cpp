@@ -37,140 +37,142 @@ if (data.size() >= 44 && data[8] >= 8 && data[8] <= 16) {
 }
 
 void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
-  ESP_LOGI(TAG, "ZTE FB101 telemetry frame (%d bytes) received", data.size());
-  ESP_LOGVV(TAG, "  %s", format_hex_pretty(&data.front(), data.size()).c_str());
-
+  ESP_LOGI(TAG, "ZTE FB101 telemetry frame (%d bytes) received", (int)data.size());
   if (data.size() < 58) {
-    // frame terlalu pendek, abaikan
+    ESP_LOGW(TAG, "ZTE FB101 frame too short: %d bytes", (int)data.size());
     return;
   }
 
+  // helper safe read 16-bit big-endian
   auto zte_u16 = [&](size_t i) -> uint16_t {
-    if (i + 1 >= data.size()) {
-      return 0;
-    }
-    return (uint16_t(data[i]) << 8) | uint16_t(data[i + 1]);
+    if (i + 1 >= data.size()) return 0;
+    return (static_cast<uint16_t>(data[i]) << 8) | static_cast<uint16_t>(data[i + 1]);
   };
 
-  // --------------------
-  // CELL VOLTAGES (15 cell) mulai index 8
-  // --------------------
+  // -----------------------
+  // Cells (15 cells, offset 8)
+  // -----------------------
   const int CELL_COUNT = 15;
-  float min_v = 100.0f;
-  float max_v = -100.0f;
   float sum_v = 0.0f;
-  int min_i = 0;
-  int max_i = 0;
+  float min_v = 1e6f;
+  float max_v = -1e6f;
+  int min_idx = -1, max_idx = -1;
 
-  for (int i = 0; i < CELL_COUNT; i++) {
+  for (int i = 0; i < CELL_COUNT; ++i) {
     size_t idx = 8 + i * 2;
-    if (idx + 1 >= data.size())
-      break;
+    if (idx + 1 >= data.size()) break;
+    uint16_t raw = zte_u16(idx);
+    float v = raw / 1000.0f; // raw is in mV e.g. 3374 -> 3.374 V
 
-    uint16_t raw = zte_u16(idx);           // misal 3374 → 0x0D2E
-    float voltage = raw / 1000.0f;         // 3374 → 3.374 V
-
-    // publish ke sensor cell
-    if (i < 16) { // cells_ biasanya di-declare 16 elemen
-      this->publish_state_(this->cells_[i].cell_voltage_sensor_, voltage);
+    // publish cell sensor if available
+    if (i < (int)this->cells_.size() && this->cells_[i].cell_voltage_sensor_ != nullptr) {
+      this->publish_state_(this->cells_[i].cell_voltage_sensor_, v);
     }
 
-    // statistik
-    sum_v += voltage;
-    if (voltage < min_v) {
-      min_v = voltage;
-      min_i = i + 1;
-    }
-    if (voltage > max_v) {
-      max_v = voltage;
-      max_i = i + 1;
-    }
+    sum_v += v;
+    if (v < min_v) { min_v = v; min_idx = i + 1; }
+    if (v > max_v) { max_v = v; max_idx = i + 1; }
   }
 
-  float avg = sum_v / CELL_COUNT;
-  float total_v = sum_v;  // total tegangan pack
+  float avg_v = (CELL_COUNT > 0) ? (sum_v / (float)CELL_COUNT) : 0.0f;
+  float total_v = sum_v; // pack voltage = sum of cell voltages
 
-  this->publish_state_(this->min_cell_voltage_sensor_, min_v);
-  this->publish_state_(this->max_cell_voltage_sensor_, max_v);
-  this->publish_state_(this->min_voltage_cell_sensor_, (float) min_i);
-  this->publish_state_(this->max_voltage_cell_sensor_, (float) max_i);
-  this->publish_state_(this->delta_cell_voltage_sensor_, max_v - min_v);
-  this->publish_state_(this->average_cell_voltage_sensor_, avg);
+  // publish cell statistics (check pointers)
+  if (this->min_cell_voltage_sensor_ != nullptr) this->publish_state_(this->min_cell_voltage_sensor_, min_v);
+  if (this->max_cell_voltage_sensor_ != nullptr) this->publish_state_(this->max_cell_voltage_sensor_, max_v);
+  if (this->delta_cell_voltage_sensor_ != nullptr) this->publish_state_(this->delta_cell_voltage_sensor_, (max_v - min_v));
+  if (this->average_cell_voltage_sensor_ != nullptr) this->publish_state_(this->average_cell_voltage_sensor_, avg_v);
+  if (min_idx > 0 && this->min_voltage_cell_sensor_ != nullptr) this->publish_state_(this->min_voltage_cell_sensor_, (float)min_idx);
+  if (max_idx > 0 && this->max_voltage_cell_sensor_ != nullptr) this->publish_state_(this->max_voltage_cell_sensor_, (float)max_idx);
 
-  // total voltage → dari jumlah cell
-  this->publish_state_(this->total_voltage_sensor_, total_v);
+  // publish total voltage
+  if (this->total_voltage_sensor_ != nullptr) {
+    this->publish_state_(this->total_voltage_sensor_, total_v);
+  }
 
-  // --------------------
-  // TEMPERATUR
-  // index 38 = jumlah sensor, 39.. = temp1,2,3 (0.01 °C)
-  // --------------------
+  // -----------------------
+  // Temperatures: data[38] = count, data[39..] temperature words (0.01 °C)
+  // -----------------------
   if (data.size() > 39) {
     uint8_t tcount = data[38];
-    for (int t = 0; t < tcount && t < 3; t++) {
+    for (int t = 0; t < 3 && t < (int)tcount; ++t) {
       size_t tidx = 39 + t * 2;
-      if (tidx + 1 >= data.size())
-        break;
-
-      float raw_t = (float) zte_u16(tidx);
-      float temp = raw_t / 100.0f;  // 3000 → 30.00 °C
-      this->publish_state_(this->temperatures_[t].temperature_sensor_, temp);
+      if (tidx + 1 >= data.size()) break;
+      float t_raw = static_cast<float>(zte_u16(tidx));
+      float t_c = t_raw / 100.0f; // 3000 -> 30.00 °C
+      if (t < (int)this->temperatures_.size() && this->temperatures_[t].temperature_sensor_ != nullptr) {
+        this->publish_state_(this->temperatures_[t].temperature_sensor_, t_c);
+      }
     }
   }
 
-  // --------------------
-  // CURRENT dari F1 (index 45–46)
-  // --------------------
-  int16_t cur_raw = (int16_t) zte_u16(45);
-  // dari data kamu: 0xFFED = -19 → -0.19 A (idle), 0x0019 = 25 → 0.25 A, dsb
+  // -----------------------
+  // Current (word 45-46) - signed
+  // -----------------------
+  int16_t cur_raw = static_cast<int16_t>(zte_u16(45));
+  // scale: raw / 100.0 -> Ampere (empiris dari log)
   float current = cur_raw / 100.0f;
-  this->publish_state_(this->current_sensor_, current);
+  if (this->current_sensor_ != nullptr) this->publish_state_(this->current_sensor_, current);
 
-  // --------------------
-  // FULL CAPACITY & SOH (F2)
-  // --------------------
-  uint16_t cap_raw = zte_u16(47);      // contoh: 0x1405 = 5125
-  // konstanta empiris: 5125 / 97.05 ≈ 52.8
-  float full_cap = cap_raw / 52.8f;    // ≈ 97 Ah untuk pack kamu
-  this->publish_state_(this->battery_capacity_sensor_, full_cap);
+  // -----------------------
+  // Full capacity raw -> full_cap (Ah)
+  // We use empiric decode factor 52.8 (derived from observed pairs raw->Ah)
+  // -----------------------
+  uint16_t cap_raw = zte_u16(47);
+  const float DECODE_CAP_FACTOR = 52.8f; // empiric factor (raw / 52.8 => Ah)
+  float full_cap = cap_raw / DECODE_CAP_FACTOR;
+  if (this->battery_capacity_sensor_ != nullptr) this->publish_state_(this->battery_capacity_sensor_, full_cap);
 
-  // treat full_cap (Ah) sebagai SOH (% dari nominal 100 Ah)
-  float soh = full_cap;
-  this->publish_state_(this->state_of_health_sensor_, soh);
+  // -----------------------
+  // SOH calculation (configurable rated_capacity)
+  // By default assume nominal/rated capacity 100.0 Ah for this pack; change if needed.
+  // -----------------------
+  const float rated_capacity = 100.0f; // <-- edit this value if your pack nominal differs
+  float soh = 0.0f;
+  if (rated_capacity > 0.0f) soh = (full_cap / rated_capacity) * 100.0f;
+  if (this->state_of_health_sensor_ != nullptr) this->publish_state_(this->state_of_health_sensor_, soh);
 
-  // --------------------
-  // SOC (F5, index 52–53, 0.01 %)
-  // --------------------
-  float soc = zte_u16(52) / 100.0f;    // 0x2328 = 9000 → 90.00 %
-  this->publish_state_(this->state_of_charge_sensor_, soc);
+  // -----------------------
+  // SOC (word 52-53) - scale 0.01%
+  // -----------------------
+  float soc = zte_u16(52) / 100.0f;
+  if (this->state_of_charge_sensor_ != nullptr) this->publish_state_(this->state_of_charge_sensor_, soc);
 
-  // --------------------
-  // RESIDUAL CAPACITY (turunan SOC × full_cap)
-  // --------------------
-  float rem_cap = (full_cap > 0.0f) ? (full_cap * soc / 100.0f) : 0.0f;
-  this->publish_state_(this->residual_capacity_sensor_, rem_cap);
+  // -----------------------
+  // Residual capacity (Ah) from SOC * full_cap
+  // -----------------------
+  float rem_cap = (full_cap > 0.0f) ? (full_cap * (soc / 100.0f)) : 0.0f;
+  if (this->residual_capacity_sensor_ != nullptr) this->publish_state_(this->residual_capacity_sensor_, rem_cap);
 
-  // --------------------
-  // POWER = V × I
-  // --------------------
+  // -----------------------
+  // Power calculations (use total_v computed above)
+  // -----------------------
+  // Make sure total_v is valid number; fallback to avg_v*CELL_COUNT if sum_v was incomplete
+  if (!std::isfinite(total_v) || total_v <= 0.0f) total_v = avg_v * (float)CELL_COUNT;
+
   float power = total_v * current;
-  this->publish_state_(this->power_sensor_, power);
+  if (this->power_sensor_ != nullptr) this->publish_state_(this->power_sensor_, power);
 
-  if (current > 0.0f) {
-    // charging
-    this->publish_state_(this->charging_power_sensor_, power);
-    this->publish_state_(this->discharging_power_sensor_, 0.0f);
-  } else {
-    // discharging atau idle
-    this->publish_state_(this->charging_power_sensor_, 0.0f);
-    this->publish_state_(this->discharging_power_sensor_, -power);
+  if (this->charging_power_sensor_ != nullptr && this->discharging_power_sensor_ != nullptr) {
+    if (current >= 0.0f) {
+      this->publish_state_(this->charging_power_sensor_, power);
+      this->publish_state_(this->discharging_power_sensor_, 0.0f);
+    } else {
+      this->publish_state_(this->charging_power_sensor_, 0.0f);
+      this->publish_state_(this->discharging_power_sensor_, -power);
+    }
   }
 
-  // --------------------
-  // CYCLE COUNT (F6), scaling empiris
-  // --------------------
-  float cycles = zte_u16(55) / 202.0f;  // ≈ 295 atau ≈ 461 sesuai pack
-  this->publish_state_(this->charging_cycles_sensor_, cycles);
+  // -----------------------
+  // Cycle count (word 55-56) - empirical scaling
+  // -----------------------
+  float cycles = zte_u16(55) / 202.0f; // empirical mapping; tweak if necessary
+  if (this->charging_cycles_sensor_ != nullptr) this->publish_state_(this->charging_cycles_sensor_, cycles);
+
+  // done
 }
+
+
 
 void SeplosBms::on_telemetry_data_(const std::vector<uint8_t> &data) {
   auto seplos_get_16bit = [&](size_t i) -> uint16_t {
