@@ -49,6 +49,10 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
     return (static_cast<uint16_t>(data[i]) << 8) | static_cast<uint16_t>(data[i + 1]);
   };
 
+  // sizes for member C-style arrays
+  const int CELLS_ARRAY_LEN = static_cast<int>(sizeof(this->cells_) / sizeof(this->cells_[0]));      // likely 16
+  const int TEMPS_ARRAY_LEN = static_cast<int>(sizeof(this->temperatures_) / sizeof(this->temperatures_[0])); // likely 6
+
   // -----------------------
   // Cells (15 cells, offset 8)
   // -----------------------
@@ -64,8 +68,8 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
     uint16_t raw = zte_u16(idx);
     float v = raw / 1000.0f; // raw is in mV e.g. 3374 -> 3.374 V
 
-    // publish cell sensor if available
-    if (i < (int)this->cells_.size() && this->cells_[i].cell_voltage_sensor_ != nullptr) {
+    // publish cell sensor if available (guard with real array length)
+    if (i < CELLS_ARRAY_LEN && this->cells_[i].cell_voltage_sensor_ != nullptr) {
       this->publish_state_(this->cells_[i].cell_voltage_sensor_, v);
     }
 
@@ -100,7 +104,8 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
       if (tidx + 1 >= data.size()) break;
       float t_raw = static_cast<float>(zte_u16(tidx));
       float t_c = t_raw / 100.0f; // 3000 -> 30.00 °C
-      if (t < (int)this->temperatures_.size() && this->temperatures_[t].temperature_sensor_ != nullptr) {
+
+      if (t < TEMPS_ARRAY_LEN && this->temperatures_[t].temperature_sensor_ != nullptr) {
         this->publish_state_(this->temperatures_[t].temperature_sensor_, t_c);
       }
     }
@@ -133,7 +138,7 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   if (this->state_of_health_sensor_ != nullptr) this->publish_state_(this->state_of_health_sensor_, soh);
 
   // -----------------------
-  // SOC (word 52-53) - scale 0.01%
+  // SOC (word 52-53) - scale 0.01 %
   // -----------------------
   float soc = zte_u16(52) / 100.0f;
   if (this->state_of_charge_sensor_ != nullptr) this->publish_state_(this->state_of_charge_sensor_, soc);
@@ -147,7 +152,6 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   // -----------------------
   // Power calculations (use total_v computed above)
   // -----------------------
-  // Make sure total_v is valid number; fallback to avg_v*CELL_COUNT if sum_v was incomplete
   if (!std::isfinite(total_v) || total_v <= 0.0f) total_v = avg_v * (float)CELL_COUNT;
 
   float power = total_v * current;
@@ -171,8 +175,6 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
 
   // done
 }
-
-
 
 void SeplosBms::on_telemetry_data_(const std::vector<uint8_t> &data) {
   auto seplos_get_16bit = [&](size_t i) -> uint16_t {
