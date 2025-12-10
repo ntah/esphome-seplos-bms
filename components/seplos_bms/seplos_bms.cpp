@@ -10,39 +10,23 @@ static const char *const TAG = "seplos_bms";
 static const uint8_t MAX_NO_RESPONSE_COUNT = 5;
 
 void SeplosBms::on_seplos_modbus_data(const std::vector<uint8_t> &data) {
-  this->reset_online_status_tracker_();
+    this->reset_online_status_tracker_();
 
-  // num_of_cells   frame_size   data_len
-  // 8              65           118 (0x76)   guessed
-  // 14             77           142 (0x8E)
-  // 15             79           146 (0x92)
-  // 16             81           150 (0x96)
-// ZTE FRAME
-if (data.size() >= 58 
-    && data[0] == 0x21      // protocol header (ASCII '~21' decoded)
-    && data[2] == 0x46      // device type
-    && data[3] == 0x00) {   // ZTE always sends CID2=0x00 here
-    this->on_zte_telemetry_(data);
-    return;
-}
+    // ZTE
+    if (data.size() >= 58 && data[0] == 0x21 && data[2] == 0x46 && data[3] == 0x00) {
+        this->on_zte_telemetry_(data);
+        return;
+    }
 
-// SHOTO MCB FRAME
-if (data.size() >= 60 
-    && data[0] == 0x26 
-    && data[2] == 0x46 
-    && data[3] == 0x00) {
-    this->on_telemetry_data_(data);
-    return;
-}
+    // SHOTO MCB
+    if (data.size() >= 60 && data[0] == 0x26 && data[2] == 0x46 && data[3] == 0x00) {
+        this->on_shoto_telemetry_(data);
+        return;
+    }
 
-// SEPLOS FRAME
-//if (data.size() >= 44 && data[8] >= 8 && data[8] <= 16) {
-//    this->on_telemetry_data_(data);
-//    return;
-//}
-
-  ESP_LOGW(TAG, "Unhandled data received (data_len: 0x%02X): %s", data[5],
-           format_hex_pretty(&data.front(), data.size()).c_str());
+    // No other protocol accepted
+    ESP_LOGW(TAG, "Unknown frame discarded: %s",
+             format_hex_pretty(&data.front(), data.size()).c_str());
 }
 
 void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
@@ -182,6 +166,118 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   if (this->charging_cycles_sensor_ != nullptr) this->publish_state_(this->charging_cycles_sensor_, cycles);
 
   // done
+}
+
+void SeplosBms::on_shoto_telemetry_(const std::vector<uint8_t> &data) {
+    ESP_LOGI(TAG, "SHOTO MCB telemetry frame (%d bytes) received", (int)data.size());
+
+    auto u16 = [&](size_t i) -> uint16_t {
+        if (i + 1 >= data.size()) return 0;
+        return (uint16_t(data[i]) << 8) | data[i + 1];
+    };
+
+    // -----------------------------
+    // CELLS (selalu 15)
+    // mulai dari offset 10
+    // -----------------------------
+    const int CELL_COUNT = 15;
+    int offset = 10;
+
+    float sum = 0, min_v = 99, max_v = 0;
+    int min_idx = -1, max_idx = -1;
+
+    for (int i = 0; i < CELL_COUNT; i++) {
+        float v = u16(offset + i * 2) / 1000.0f;
+
+        if (this->cells_[i].cell_voltage_sensor_ != nullptr)
+            this->publish_state_(this->cells_[i].cell_voltage_sensor_, v);
+
+        sum += v;
+        if (v < min_v) { min_v = v; min_idx = i + 1; }
+        if (v > max_v) { max_v = v; max_idx = i + 1; }
+    }
+
+    float avg = sum / CELL_COUNT;
+    float total_v = sum;
+
+    this->publish_state_(this->min_cell_voltage_sensor_, min_v);
+    this->publish_state_(this->max_cell_voltage_sensor_, max_v);
+    this->publish_state_(this->delta_cell_voltage_sensor_, max_v - min_v);
+    this->publish_state_(this->average_cell_voltage_sensor_, avg);
+    if (min_idx > 0) this->publish_state_(this->min_voltage_cell_sensor_, min_idx);
+    if (max_idx > 0) this->publish_state_(this->max_voltage_cell_sensor_, max_idx);
+
+    offset += CELL_COUNT * 2;
+
+    // -----------------------------
+    // TEMPERATURE (5 sensor)
+    // raw: (value - 2731) * 0.1
+    // -----------------------------
+    for (int t = 0; t < 5; t++) {
+        float raw = u16(offset + t * 2);
+        float temp_c = (raw - 2731.0f) * 0.1f;
+
+        if (this->temperatures_[t].temperature_sensor_)
+            this->publish_state_(this->temperatures_[t].temperature_sensor_, temp_c);
+    }
+
+    offset += 5 * 2;
+
+    // -----------------------------
+    // CURRENT
+    // -----------------------------
+    float current = (int16_t)u16(offset) * 0.01f;
+    if (this->current_sensor_)
+        this->publish_state_(this->current_sensor_, current);
+
+    offset += 2;
+
+    // -----------------------------
+    // TOTAL VOLTAGE
+    // -----------------------------
+    float voltage = u16(offset) * 0.01f;
+    this->publish_state_(this->total_voltage_sensor_, voltage);
+
+    offset += 2;
+
+    // -----------------------------
+    // POWER
+    // -----------------------------
+    float power = voltage * current;
+    this->publish_state_(this->power_sensor_, power);
+    this->publish_state_(this->charging_power_sensor_, (current > 0 ? power : 0));
+    this->publish_state_(this->discharging_power_sensor_, (current < 0 ? -power : 0));
+
+    // -----------------------------
+    // RESIDUAL CAPACITY (Ah)
+    // -----------------------------
+    float rem = u16(offset) * 0.01f;
+    this->publish_state_(this->residual_capacity_sensor_, rem);
+    offset += 2;
+
+    // -----------------------------
+    // TOTAL CAPACITY
+    // -----------------------------
+    float cap = u16(offset + 1) * 0.01f;
+    this->publish_state_(this->battery_capacity_sensor_, cap);
+
+    // -----------------------------
+    // SOC (%)
+    // -----------------------------
+    float soc = u16(offset + 3) * 0.1f;
+    this->publish_state_(this->state_of_charge_sensor_, soc);
+
+    // -----------------------------
+    // SOH (%)
+    // -----------------------------
+    float soh = u16(offset + 7) * 0.1f;
+    this->publish_state_(this->state_of_health_sensor_, soh);
+
+    // -----------------------------
+    // CYCLE COUNT
+    // -----------------------------
+    float cycles = u16(offset + 5);
+    this->publish_state_(this->charging_cycles_sensor_, cycles);
 }
 
 void SeplosBms::on_telemetry_data_(const std::vector<uint8_t> &data) {

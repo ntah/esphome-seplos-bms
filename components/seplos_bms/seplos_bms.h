@@ -119,8 +119,6 @@ class SeplosBms : public PollingComponent, public seplos_modbus::SeplosModbusDev
   void on_telemetry_data_(const std::vector<uint8_t> &data);
   // ADD THIS for ZTE support:
   void on_zte_telemetry_(const std::vector<uint8_t> &data);
-  // ADD THIS for SHOTO MCB support:
-  void on_shoto_telemetry_(const std::vector<uint8_t> &data);
   void reset_online_status_tracker_();
   void track_online_status_();
   void publish_device_unavailable_();
