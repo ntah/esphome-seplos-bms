@@ -18,13 +18,13 @@ void SeplosBms::on_seplos_modbus_data(const std::vector<uint8_t> &data) {
   // 15             79           146 (0x92)
   // 16             81           150 (0x96)
 // ZTE FRAME
-if (data.size() == 58 {
+if (data.size() == 58) {
     this->on_zte_telemetry_(data);
     return;
 }
 
 // SHOTO MCB FRAME
-if (data.size() == 63 {
+if (data.size() == 63) {
     this->on_telemetry_data_(data);
     return;
 }
