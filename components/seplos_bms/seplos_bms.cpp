@@ -26,8 +26,11 @@ if (data.size() >= 58
     return;
 }
 
-// SEPLOS FRAME
-if (data.size() >= 44 && data[8] >= 8 && data[8] <= 16) {
+// SHOTO MCB FRAME
+if (data.size() >= 60 
+    && data[0] == 0x26 
+    && data[2] == 0x46 
+    && data[3] == 0x00) {
     this->on_telemetry_data_(data);
     return;
 }
