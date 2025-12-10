@@ -29,8 +29,7 @@ if (data.size() == 63) {
     return;
 }
 
-  ESP_LOGW(TAG, "Unhandled data received (data_len: 0x%02X): %s", data[5],
-           format_hex_pretty(&data.front(), data.size()).c_str());
+//  ESP_LOGW(TAG, "Unhandled data received (data_len: 0x%02X): %s", data[5], format_hex_pretty(&data.front(), data.size()).c_str());
 }
 
 void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {

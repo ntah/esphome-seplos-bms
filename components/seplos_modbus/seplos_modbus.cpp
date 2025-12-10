@@ -143,7 +143,7 @@ if (computed_crc != remote_crc) {
   }
 
   if (!found) {
-    ESP_LOGW(TAG, "Got SeplosModbus frame from unknown address 0x%02X! ", address);
+//    ESP_LOGW(TAG, "Got SeplosModbus frame from unknown address 0x%02X! ", address);
   }
 
   // return false to reset buffer
