@@ -26,11 +26,20 @@ if (data.size() >= 58
     return;
 }
 
-// SEPLOS FRAME
-if (data.size() >= 44 && data[8] >= 8 && data[8] <= 16) {
-    this->on_telemetry_data_(data);
+// SHOTO MCB FRAME
+if (data.size() >= 60 
+    && data[0] == 0x26 
+    && data[2] == 0x46 
+    && data[3] == 0x00) {
+    this->on_shoto_telemetry_(data);
     return;
 }
+
+// SEPLOS FRAME
+//if (data.size() >= 44 && data[8] >= 8 && data[8] <= 16) {
+//    this->on_telemetry_data_(data);
+//    return;
+//}
 
   ESP_LOGW(TAG, "Unhandled data received (data_len: 0x%02X): %s", data[5],
            format_hex_pretty(&data.front(), data.size()).c_str());
@@ -173,6 +182,89 @@ void SeplosBms::on_zte_telemetry_(const std::vector<uint8_t> &data) {
   if (this->charging_cycles_sensor_ != nullptr) this->publish_state_(this->charging_cycles_sensor_, cycles);
 
   // done
+}
+
+void SeplosBms::on_shoto_telemetry_(const std::vector<uint8_t> &data) {
+  ESP_LOGI(TAG, "Shoto MCB telemetry frame (%d bytes) received", (int)data.size());
+
+  auto u16 = [&](size_t i) -> uint16_t {
+    if (i + 1 >= data.size()) return 0;
+    return (uint16_t(data[i]) << 8) | uint16_t(data[i + 1]);
+  };
+
+  // -----------------------------------------
+  // CELL VOLTAGES (always 15 cells)
+  // -----------------------------------------
+  float sum_v = 0, min_v = 999, max_v = -999;
+  for (int i = 0; i < 15; i++) {
+    float v = u16(8 + i*2) / 1000.0f;
+    sum_v += v;
+    if (v < min_v) min_v = v;
+    if (v > max_v) max_v = v;
+
+    if (this->cells_[i].cell_voltage_sensor_)
+      this->publish_state_(this->cells_[i].cell_voltage_sensor_, v);
+  }
+
+  float avg_v = sum_v / 15.0f;
+
+  if (this->min_cell_voltage_sensor_) this->publish_state_(this->min_cell_voltage_sensor_, min_v);
+  if (this->max_cell_voltage_sensor_) this->publish_state_(this->max_cell_voltage_sensor_, max_v);
+  if (this->delta_cell_voltage_sensor_) this->publish_state_(this->delta_cell_voltage_sensor_, max_v - min_v);
+  if (this->average_cell_voltage_sensor_) this->publish_state_(this->average_cell_voltage_sensor_, avg_v);
+
+  // -----------------------------------------
+  // TEMPERATURES (6 sensors)
+  // -----------------------------------------
+  size_t tpos = 8 + 15*2;
+  for (int t = 0; t < 6; t++) {
+    float raw = u16(tpos + t*2);
+    float temp = (raw - 2731) * 0.1f;
+    if (this->temperatures_[t].temperature_sensor_)
+      this->publish_state_(this->temperatures_[t].temperature_sensor_, temp);
+  }
+
+  // -----------------------------------------
+  // CURRENT
+  // -----------------------------------------
+  float current = (int16_t)u16(tpos + 12) * 0.01f;
+  if (this->current_sensor_) this->publish_state_(this->current_sensor_, current);
+
+  // -----------------------------------------
+  // TOTAL VOLTAGE
+  // -----------------------------------------
+  float total_v = u16(tpos + 14) * 0.01f;
+  if (this->total_voltage_sensor_) this->publish_state_(this->total_voltage_sensor_, total_v);
+
+  float power = total_v * current;
+  if (this->power_sensor_) this->publish_state_(this->power_sensor_, power);
+  if (this->charging_power_sensor_) this->publish_state_(this->charging_power_sensor_, std::max(0.0f, power));
+  if (this->discharging_power_sensor_) this->publish_state_(this->discharging_power_sensor_, std::abs(std::min(0.0f, power)));
+
+  // -----------------------------------------
+  // CAPACITIES
+  // -----------------------------------------
+  float rem_cap = u16(tpos + 16) * 0.01f;
+  float full_cap = u16(tpos + 20) * 0.01f;
+
+  if (this->residual_capacity_sensor_) this->publish_state_(this->residual_capacity_sensor_, rem_cap);
+  if (this->battery_capacity_sensor_) this->publish_state_(this->battery_capacity_sensor_, full_cap);
+
+  // SOC (%)
+  float soc = u16(tpos + 22) * 0.1f;
+  if (this->state_of_charge_sensor_) this->publish_state_(this->state_of_charge_sensor_, soc);
+
+  // Rated capacity
+  float rated = u16(tpos + 24) * 0.01f;
+  if (this->rated_capacity_sensor_) this->publish_state_(this->rated_capacity_sensor_, rated);
+
+  // Cycles
+  float cycles = u16(tpos + 26);
+  if (this->charging_cycles_sensor_) this->publish_state_(this->charging_cycles_sensor_, cycles);
+
+  // SOH
+  float soh = u16(tpos + 28) * 0.1f;
+  if (this->state_of_health_sensor_) this->publish_state_(this->state_of_health_sensor_, soh);
 }
 
 void SeplosBms::on_telemetry_data_(const std::vector<uint8_t> &data) {
