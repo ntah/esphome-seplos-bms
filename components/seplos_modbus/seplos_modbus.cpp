@@ -37,6 +37,10 @@ void SeplosModbus::loop() {
   }
 }
 
+/**
+ * Existing checksum function (kept for non-ZTE frames).
+ * This computes two's-complement of the sum of bytes in 'data' (i.e. ~sum + 1).
+ */
 uint16_t chksum(const uint8_t data[], const uint16_t len) {
   uint16_t checksum = 0x00;
   for (uint16_t i = 0; i < len; i++) {
@@ -47,6 +51,25 @@ uint16_t chksum(const uint8_t data[], const uint16_t len) {
   return checksum;
 }
 
+/**
+ * ZTE-specific checksum:
+ * Compute sum of ASCII bytes from payload (not the interpreted hex bytes),
+ * then return (0x10000 - (sum & 0xFFFF)) & 0xFFFF.
+ *
+ * This is equivalent to two's-complement negation of the 16-bit sum.
+ */
+uint16_t zte_ascii_crc(const uint8_t data[], const uint16_t len) {
+  uint32_t sum = 0;
+  for (uint16_t i = 0; i < len; i++) {
+    sum += data[i];
+  }
+  uint16_t sum16 = static_cast<uint16_t>(sum & 0xFFFF);
+  return static_cast<uint16_t>((0x10000 - sum16) & 0xFFFF);
+}
+
+/**
+ * length checksum helper used when sending frames (unchanged).
+ */
 uint16_t lchksum(const uint16_t len) {
   uint16_t lchecksum = 0x0000;
 
@@ -105,34 +128,49 @@ bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
     return false;
   }
 
+  // data_len = number of ASCII payload bytes (from raw[1] .. raw[1 + data_len - 1])
   uint16_t data_len = at - 4 - 1;
-  uint16_t computed_crc = chksum(raw + 1, data_len);
+
+  // Remote CRC is encoded as 4 ASCII hex chars just before CR:
+  // positions (at-4, at-3, at-2, at-1)
   uint16_t remote_crc = uint16_t(ascii_hex_to_byte(raw[at - 4], raw[at - 3])) << 8 |
                         (uint16_t(ascii_hex_to_byte(raw[at - 2], raw[at - 1])) << 0);
-// ---------------------------------------------------------------------
-// ZTE FB101 patch:
-// ZTE frames start with "~21..." and DO NOT use Modbus CRC.
-// Skip CRC check if frame type = 0x21 (ASCII '2''1')
-// ---------------------------------------------------------------------
-if (computed_crc != remote_crc) {
 
-    // Ensure enough bytes exist before checking
-    if (at >= 2 && raw[1] == '2' && raw[2] == '1') {
-        ESP_LOGW(TAG, "CRC mismatch but accepting as ZTE FB101 frame");
-        // Accept frame and continue
-    } else {
-        ESP_LOGW(TAG, "CRC check failed! 0x%04X != 0x%04X", computed_crc, remote_crc);
-        return false;
+  // Detect ZTE frames (they typically start with "~21...")
+  bool is_zte = false;
+  if (data_len >= 2) {
+    // raw[1] and raw[2] are ASCII chars
+    if (raw[1] == '2' && raw[2] == '1') {
+      is_zte = true;
     }
-}
-// ---------------------------------------------------------------------
+  }
 
+  uint16_t computed_crc = 0;
+  if (is_zte) {
+    computed_crc = zte_ascii_crc(raw + 1, data_len);
+    ESP_LOGVV(TAG, "ZTE frame detected. ASCII-sum CRC computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
+  } else {
+    computed_crc = chksum(raw + 1, data_len);
+    ESP_LOGVV(TAG, "Non-ZTE frame. generic chksum computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
+  }
+
+  if (computed_crc != remote_crc) {
+    ESP_LOGW(TAG, "CRC check failed! computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
+    return false;
+  }
+
+  // Convert ASCII hex payload to binary bytes (payload starts at raw[1], length = data_len)
   std::vector<uint8_t> data;
   for (uint16_t i = 1; i < data_len; i = i + 2) {
     data.push_back(ascii_hex_to_byte(raw[i], raw[i + 1]));
   }
 
-  uint8_t address = data[1];
+  // NOTE: In the data vector, position mapping assumed by original code:
+  // data[0] = VER, data[1] = ADDR, data[2] = CID1, data[3] = CID2, ...
+  uint8_t address = 0xFF;
+  if (data.size() > 1) {
+    address = data[1];
+  }
 
   bool found = false;
   for (auto *device : this->devices_) {
@@ -179,8 +217,8 @@ void SeplosModbus::send(uint8_t protocol_version, uint8_t address, uint8_t funct
   payload.append(byte_to_ascii_hex(data.data(), frame_len));
 
   uint16_t crc = chksum((const uint8_t *) payload.data() + 1, payload.size() - 1);
-  data.push_back(crc >> 8);  // CHKSUM (0xFD)
-  data.push_back(crc >> 0);  // CHKSUM (0x37)
+  data.push_back(crc >> 8);  // CHKSUM (high byte)
+  data.push_back(crc >> 0);  // CHKSUM (low byte)
 
   payload.append(byte_to_ascii_hex(data.data() + frame_len, data.size() - frame_len));  // Append checksum
   payload.append("\r");                                                                 // EOF (0x0D)
