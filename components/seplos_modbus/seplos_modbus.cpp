@@ -199,3 +199,14 @@ void SeplosModbus::send(uint8_t protocol_version, uint8_t address, uint8_t funct
 
 } // namespace seplos_modbus
 } // namespace esphome
+
+void SeplosModbus::dump_config() {
+  ESP_LOGCONFIG("seplos_modbus", "SeplosModbus:");
+  LOG_PIN("  Flow Control Pin: ", this->flow_control_pin_);
+  ESP_LOGCONFIG("seplos_modbus", "  RX timeout: %d ms", this->rx_timeout_);
+}
+
+float SeplosModbus::get_setup_priority() const {
+  // Always after UART bus
+  return esphome::setup_priority::BUS - 1.0f;
+}
