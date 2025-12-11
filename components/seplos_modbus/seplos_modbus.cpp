@@ -1,197 +1,262 @@
 #include "seplos_modbus.h"
 #include "esphome/core/log.h"
-#include "esphome/core/helpers.h"
+#include <ctype.h>
 
 namespace esphome {
 namespace seplos_modbus {
 
 static const char *const TAG = "seplos_modbus";
 
-static const uint16_t MAX_RESPONSE_SIZE = 340;
+// Fallback RX timeout (ms) for assembling large frames (Shoto telemetry)
+static const uint32_t RX_TIMEOUT_FALLBACK = 40U;
+
+// Simple CRC16-MODBUS on ASCII bytes (keadaan: tidak mengubah logika CRC lama)
+static uint16_t crc16_ascii(const std::string &ascii) {
+  uint16_t crc = 0xFFFF;
+  for (unsigned char ch : ascii) {
+    crc ^= static_cast<uint16_t>(ch);
+    for (uint8_t i = 0; i < 8; ++i) {
+      if (crc & 1)
+        crc = static_cast<uint16_t>((crc >> 1) ^ 0xA001);
+      else
+        crc = static_cast<uint16_t>(crc >> 1);
+    }
+  }
+  return crc;
+}
+
+static int hexval(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  return -1;
+}
+
+static uint8_t ascii_hex_to_byte(char a, char b) {
+  int hi = hexval(a);
+  int lo = hexval(b);
+  if (hi < 0 || lo < 0) return 0xFF;
+  return static_cast<uint8_t>((hi << 4) | lo);
+}
 
 void SeplosModbus::setup() {
-  if (this->flow_control_pin_ != nullptr) {
+  ESP_LOGCONFIG(TAG, "SeplosModbus setup()");
+  if (this->flow_control_pin_ != nullptr)
     this->flow_control_pin_->setup();
-  }
-}
-void SeplosModbus::loop() {
-  const uint32_t now = millis();
 
-  if (now - this->last_seplos_modbus_byte_ > this->rx_timeout_) {
-    ESP_LOGVV(TAG, "Buffer cleared due to timeout: %s",
-              format_hex_pretty(&this->rx_buffer_.front(), this->rx_buffer_.size()).c_str());
-    this->rx_buffer_.clear();
+  // Ensure reasonable rx timeout for building large frames
+  if (this->rx_timeout_ == 0)
+    this->rx_timeout_ = RX_TIMEOUT_FALLBACK;
+}
+
+void SeplosModbus::loop() {
+  uint8_t c;
+  while (this->available()) {
+    this->read_byte(&c);
+    this->parse_seplos_modbus_byte_(c);
+  }
+
+  // housekeeping: clear buffer on long inactivity, but avoid dropping large partial frames too eagerly
+  const uint32_t now = millis();
+  uint32_t to_use = (this->rx_timeout_ == 0 ? RX_TIMEOUT_FALLBACK : this->rx_timeout_);
+  if (now - this->last_seplos_modbus_byte_ > to_use) {
+    if (!this->rx_buffer_.empty()) {
+      // If buffer is small, likely noise -> flush
+      if (this->rx_buffer_.size() < 32) {
+        ESP_LOGV(TAG, "RX timeout: flushing small incomplete buffer (len=%u)", (unsigned)this->rx_buffer_.size());
+        this->rx_buffer_.clear();
+      } else {
+        // If buffer already large, keep it (we expect more bytes for long Shoto frames)
+        ESP_LOGV(TAG, "RX timeout but buffer large (%u) — keeping to wait for terminator", (unsigned)this->rx_buffer_.size());
+      }
+    }
     this->last_seplos_modbus_byte_ = now;
   }
+}
 
-  while (this->available()) {
-    uint8_t byte;
-    this->read_byte(&byte);
-    if (this->parse_seplos_modbus_byte_(byte)) {
-      this->last_seplos_modbus_byte_ = now;
-    } else {
-      ESP_LOGVV(TAG, "Buffer cleared due to reset: %s",
-                format_hex_pretty(&this->rx_buffer_.front(), this->rx_buffer_.size()).c_str());
+// Keep send signature compatible with header in user's repo
+void SeplosModbus::send(uint8_t protocol_version, uint8_t address, uint8_t function, uint8_t value) {
+  // Build raw bytes (kept compatible with observed patterns)
+  uint8_t raw[7];
+  raw[0] = protocol_version;
+  raw[1] = address;
+  raw[2] = 0x46;   // CID1 typical
+  raw[3] = function;
+  raw[4] = 0xE0;
+  raw[5] = 0x02;
+  raw[6] = value;
+
+  static const char HEX[] = "0123456789ABCDEF";
+  std::string ascii_body;
+  ascii_body.reserve(14);
+  for (size_t i = 0; i < 7; ++i) {
+    ascii_body.push_back(HEX[(raw[i] >> 4) & 0xF]);
+    ascii_body.push_back(HEX[raw[i] & 0xF]);
+  }
+
+  uint16_t crc = crc16_ascii(ascii_body);
+  uint8_t crc_hi = static_cast<uint8_t>((crc >> 8) & 0xFF);
+  uint8_t crc_lo = static_cast<uint8_t>(crc & 0xFF);
+
+  std::string frame = "~";
+  frame += ascii_body;
+  frame.push_back(HEX[(crc_hi >> 4) & 0xF]);
+  frame.push_back(HEX[crc_hi & 0xF]);
+  frame.push_back(HEX[(crc_lo >> 4) & 0xF]);
+  frame.push_back(HEX[crc_lo & 0xF]);
+  frame.push_back('\r');
+
+  ESP_LOGD(TAG, "TX: %s", frame.c_str());
+
+  if (this->flow_control_pin_ != nullptr)
+    this->flow_control_pin_->digital_write(true);
+
+  this->write_str(frame.c_str());
+  this->flush();
+
+  if (this->flow_control_pin_ != nullptr)
+    this->flow_control_pin_->digital_write(false);
+
+  this->last_send_ = millis();
+}
+
+// Parser: assemble until '\r' then validate CRC and forward.
+// Main difference vs original: do not drop large buffers on small timeouts; only process when '\r' seen.
+bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
+  const uint32_t now = millis();
+
+  // If a long gap occurred, only flush small buffers (to avoid dropping large Shoto frames)
+  uint32_t to_use = (this->rx_timeout_ == 0 ? RX_TIMEOUT_FALLBACK : this->rx_timeout_);
+  if (now - this->last_seplos_modbus_byte_ > to_use && !this->rx_buffer_.empty()) {
+    if (this->rx_buffer_.size() < 32) {
+      ESP_LOGV(TAG, "RX timeout while buffer small -> clearing");
       this->rx_buffer_.clear();
+    } else {
+      ESP_LOGV(TAG, "RX timeout while buffer large -> keeping (%u bytes) awaiting terminator", (unsigned)this->rx_buffer_.size());
     }
   }
-}
+  this->last_seplos_modbus_byte_ = now;
 
-uint16_t chksum(const uint8_t data[], const uint16_t len) {
-  uint16_t checksum = 0x00;
-  for (uint16_t i = 0; i < len; i++) {
-    checksum = checksum + data[i];
-  }
-  checksum = ~checksum;
-  checksum += 1;
-  return checksum;
-}
+  // Append incoming byte
+  this->rx_buffer_.push_back(static_cast<char>(byte));
 
-uint16_t lchksum(const uint16_t len) {
-  uint16_t lchecksum = 0x0000;
-
-  if (len == 0)
-    return 0x0000;
-
-  lchecksum = (len & 0xf) + ((len >> 4) & 0xf) + ((len >> 8) & 0xf);
-  lchecksum = ~(lchecksum % 16) + 1;
-
-  return (lchecksum << 12) + len;  // 4 byte checksum + 12 bytes length
-}
-
-uint8_t ascii_hex_to_byte(char a, char b) {
-  a = (a <= '9') ? a - '0' : (a & 0x7) + 9;
-  b = (b <= '9') ? b - '0' : (b & 0x7) + 9;
-
-  return (a << 4) + b;
-}
-
-static char byte_to_ascii_hex(uint8_t v) { return v >= 10 ? 'A' + (v - 10) : '0' + v; }
-std::string byte_to_ascii_hex(const uint8_t *data, size_t length) {
-  if (length == 0)
-    return "";
-  std::string ret;
-  ret.resize(2 * length);
-  for (size_t i = 0; i < length; i++) {
-    ret[2 * i] = byte_to_ascii_hex((data[i] & 0xF0) >> 4);
-    ret[2 * i + 1] = byte_to_ascii_hex(data[i] & 0x0F);
-  }
-  return ret;
-}
-
-bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
-  size_t at = this->rx_buffer_.size();
-  this->rx_buffer_.push_back(byte);
-  const uint8_t *raw = &this->rx_buffer_[0];
-
-  // Start of frame
-  if (at == 0) {
-    if (raw[0] != 0x7E) {
-      ESP_LOGW(TAG, "Invalid header: 0x%02X", raw[0]);
-
-      // return false to reset buffer
+  // First char must be '~'
+  if (this->rx_buffer_.size() == 1) {
+    if (this->rx_buffer_[0] != '~') {
+      ESP_LOGV(TAG, "Dropped leading non-~ byte 0x%02X", (unsigned)byte);
+      this->rx_buffer_.clear();
       return false;
     }
-
     return true;
   }
 
-  // End of frame '\r'
-  if (raw[at] != 0x0D)
-    return true;
-
-  if (at > MAX_RESPONSE_SIZE) {
-    ESP_LOGW(TAG, "Maximum response size exceeded. Flushing RX buffer...");
+  // Prevent runaway
+  if (this->rx_buffer_.size() > 4096) {
+    ESP_LOGW(TAG, "RX buffer too large (%u), flushing", (unsigned)this->rx_buffer_.size());
+    this->rx_buffer_.clear();
     return false;
   }
 
-  uint16_t data_len = at - 4 - 1;
-  uint16_t computed_crc = chksum(raw + 1, data_len);
-  uint16_t remote_crc = uint16_t(ascii_hex_to_byte(raw[at - 4], raw[at - 3])) << 8 |
-                        (uint16_t(ascii_hex_to_byte(raw[at - 2], raw[at - 1])) << 0);
-// ---------------------------------------------------------------------
-// ZTE FB101 patch:
-// ZTE frames start with "~21..." and DO NOT use Modbus CRC.
-// Skip CRC check if frame type = 0x21 (ASCII '2''1')
-// ---------------------------------------------------------------------
-if (computed_crc != remote_crc) {
+  // WAIT for CR terminator. Only when '\r' arrives we attempt to process.
+  if (byte != '\r') {
+    return true;
+  }
 
-    // Ensure enough bytes exist before checking
-    if (at >= 2 && raw[1] == '2' && raw[2] == '1') {
-        ESP_LOGW(TAG, "CRC mismatch but accepting as ZTE FB101 frame");
-        // Accept frame and continue
-    } else {
-        ESP_LOGW(TAG, "CRC check failed! 0x%04X != 0x%04X", computed_crc, remote_crc);
-        return false;
+  // We reached '\r' — assemble ascii_hex excluding leading '~' and trailing '\r'
+  std::string ascii_hex;
+  ascii_hex.reserve(this->rx_buffer_.size());
+  for (size_t i = 1; i + 1 < this->rx_buffer_.size(); ++i) {
+    char c = this->rx_buffer_[i];
+    if (!isxdigit((unsigned char)c)) {
+      ESP_LOGW(TAG, "Non-hex char in payload: 0x%02X -> discarding frame", (unsigned char)c);
+      this->rx_buffer_.clear();
+      return false;
     }
-}
-// ---------------------------------------------------------------------
+    ascii_hex.push_back(c);
+  }
 
+  // ascii_hex must be even and not tiny
+  if (ascii_hex.size() < 10 || (ascii_hex.size() % 2) != 0) {
+    ESP_LOGW(TAG, "Invalid ascii_hex length=%u -> drop", (unsigned)ascii_hex.size());
+    this->rx_buffer_.clear();
+    return false;
+  }
+
+  // Determine protocol (first byte)
+  uint8_t proto = ascii_hex.size() >= 2 ? ascii_hex_to_byte(ascii_hex[0], ascii_hex[1]) : 0xFF;
+
+  // If this looks like Shoto/Boqiang (proto 0x26) enforce reasonable minimum
+  if (proto == 0x26) {
+    // For Shoto telemetry typical binary length >= 60 bytes -> ascii_hex chars >= 120
+    if (ascii_hex.size() < 120) {
+      ESP_LOGW(TAG, "Shoto-like frame but too short (%u) -> drop", (unsigned)ascii_hex.size());
+      this->rx_buffer_.clear();
+      return false;
+    }
+  }
+
+  // Split body and CRC (last 4 ascii hex chars)
+  const size_t crc_pos = ascii_hex.size() - 4;
+  std::string ascii_without_crc = ascii_hex.substr(0, crc_pos);
+  std::string ascii_crc_str = ascii_hex.substr(crc_pos, 4);
+
+  // calculate CRC on ascii_without_crc
+  uint16_t calc_crc = crc16_ascii(ascii_without_crc);
+
+  // parse remote CRC (big-endian hi then lo)
+  uint8_t remote_hi = ascii_hex_to_byte(ascii_crc_str[0], ascii_crc_str[1]);
+  uint8_t remote_lo = ascii_hex_to_byte(ascii_crc_str[2], ascii_crc_str[3]);
+  uint16_t remote_crc = (static_cast<uint16_t>(remote_hi) << 8) | remote_lo;
+
+  if (remote_crc != calc_crc) {
+    ESP_LOGW(TAG, "CRC FAILED: remote=0x%04X calc=0x%04X", remote_crc, calc_crc);
+    this->rx_buffer_.clear();
+    return false;
+  }
+
+  // decode ascii_without_crc to binary bytes
+  size_t bin_len = ascii_without_crc.size() / 2;
   std::vector<uint8_t> data;
-  for (uint16_t i = 1; i < data_len; i = i + 2) {
-    data.push_back(ascii_hex_to_byte(raw[i], raw[i + 1]));
+  data.reserve(bin_len);
+  for (size_t i = 0; i < bin_len; ++i) {
+    char hi = ascii_without_crc[i * 2];
+    char lo = ascii_without_crc[i * 2 + 1];
+    uint8_t b = ascii_hex_to_byte(hi, lo);
+    data.push_back(b);
   }
 
-  uint8_t address = data[1];
+  if (data.size() < 4) {
+    ESP_LOGW(TAG, "Decoded binary too short (%u) -> drop", (unsigned)data.size());
+    this->rx_buffer_.clear();
+    return false;
+  }
 
-  bool found = false;
-  for (auto *device : this->devices_) {
-    if (device->address_ == address) {
-      device->on_seplos_modbus_data(data);
-      found = true;
+  // Forward decoded data to registered devices that match address (data[1])
+  uint8_t addr = data[1];
+  bool forwarded = false;
+  for (auto *dev : this->devices_) {
+    if (dev->address_ == addr) {
+      dev->on_seplos_modbus_data(data);
+      forwarded = true;
     }
   }
-
-  if (!found) {
-//    ESP_LOGW(TAG, "Got SeplosModbus frame from unknown address 0x%02X! ", address);
+  if (!forwarded) {
+    ESP_LOGV(TAG, "Valid frame for address 0x%02X but no matching device registered", addr);
   }
 
-  // return false to reset buffer
-  return false;
+  // Clear buffer AFTER processing — critical to avoid cutting subsequent frames
+  this->rx_buffer_.clear();
+  return true;
 }
 
 void SeplosModbus::dump_config() {
   ESP_LOGCONFIG(TAG, "SeplosModbus:");
   LOG_PIN("  Flow Control Pin: ", this->flow_control_pin_);
-  ESP_LOGCONFIG(TAG, "  RX timeout: %d ms", this->rx_timeout_);
+  ESP_LOGCONFIG(TAG, "  RX timeout: %u ms", (unsigned)this->rx_timeout_);
 }
+
 float SeplosModbus::get_setup_priority() const {
-  // After UART bus
   return setup_priority::BUS - 1.0f;
-}
-
-void SeplosModbus::send(uint8_t protocol_version, uint8_t address, uint8_t function, uint8_t value) {
-  if (this->flow_control_pin_ != nullptr)
-    this->flow_control_pin_->digital_write(true);
-
-  const uint16_t lenid = lchksum(1 * 2);
-  std::vector<uint8_t> data;
-  data.push_back(protocol_version);  // VER
-  data.push_back(address);           // ADDR
-  data.push_back(0x46);              // CID1
-  data.push_back(function);          // CID2 (0x42)
-  data.push_back(lenid >> 8);        // LCHKSUM (0xE0)
-  data.push_back(lenid >> 0);        // LENGTH (0x02)
-  data.push_back(value);             // VALUE (0x00)
-
-  const uint16_t frame_len = data.size();
-  std::string payload = "~";  // SOF (0x7E)
-  payload.append(byte_to_ascii_hex(data.data(), frame_len));
-
-  uint16_t crc = chksum((const uint8_t *) payload.data() + 1, payload.size() - 1);
-  data.push_back(crc >> 8);  // CHKSUM (0xFD)
-  data.push_back(crc >> 0);  // CHKSUM (0x37)
-
-  payload.append(byte_to_ascii_hex(data.data() + frame_len, data.size() - frame_len));  // Append checksum
-  payload.append("\r");                                                                 // EOF (0x0D)
-
-  ESP_LOGD(TAG, "Send frame: %s", payload.c_str());
-
-  this->write_str(payload.c_str());
-  this->flush();
-
-  if (this->flow_control_pin_ != nullptr)
-    this->flow_control_pin_->digital_write(false);
 }
 
 }  // namespace seplos_modbus
