@@ -18,9 +18,11 @@ void SeplosModbus::loop() {
   const uint32_t now = millis();
 
   if (now - this->last_seplos_modbus_byte_ > this->rx_timeout_) {
-    ESP_LOGVV(TAG, "Buffer cleared due to timeout: %s",
-              format_hex_pretty(&this->rx_buffer_.front(), this->rx_buffer_.size()).c_str());
-    this->rx_buffer_.clear();
+    if (!this->rx_buffer_.empty()) {
+      ESP_LOGVV(TAG, "Buffer cleared due to timeout: %s",
+                format_hex_pretty(&this->rx_buffer_.front(), this->rx_buffer_.size()).c_str());
+      this->rx_buffer_.clear();
+    }
     this->last_seplos_modbus_byte_ = now;
   }
 
@@ -30,9 +32,11 @@ void SeplosModbus::loop() {
     if (this->parse_seplos_modbus_byte_(byte)) {
       this->last_seplos_modbus_byte_ = now;
     } else {
-      ESP_LOGVV(TAG, "Buffer cleared due to reset: %s",
-                format_hex_pretty(&this->rx_buffer_.front(), this->rx_buffer_.size()).c_str());
-      this->rx_buffer_.clear();
+      if (!this->rx_buffer_.empty()) {
+        ESP_LOGVV(TAG, "Buffer cleared due to reset: %s",
+                  format_hex_pretty(&this->rx_buffer_.front(), this->rx_buffer_.size()).c_str());
+        this->rx_buffer_.clear();
+      }
     }
   }
 }
@@ -42,13 +46,13 @@ void SeplosModbus::loop() {
  * This computes two's-complement of the sum of bytes in 'data' (i.e. ~sum + 1).
  */
 uint16_t chksum(const uint8_t data[], const uint16_t len) {
-  uint16_t checksum = 0x00;
+  uint32_t checksum = 0;
   for (uint16_t i = 0; i < len; i++) {
-    checksum = checksum + data[i];
+    checksum += data[i];
   }
   checksum = ~checksum;
   checksum += 1;
-  return checksum;
+  return static_cast<uint16_t>(checksum & 0xFFFF);
 }
 
 /**
@@ -79,7 +83,7 @@ uint16_t lchksum(const uint16_t len) {
   lchecksum = (len & 0xf) + ((len >> 4) & 0xf) + ((len >> 8) & 0xf);
   lchecksum = ~(lchecksum % 16) + 1;
 
-  return (lchecksum << 12) + len;  // 4 byte checksum + 12 bytes length
+  return (lchecksum << 12) + len;  // 4 nibble checksum + 12 bits length
 }
 
 uint8_t ascii_hex_to_byte(char a, char b) {
@@ -111,11 +115,9 @@ bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
   if (at == 0) {
     if (raw[0] != 0x7E) {
       ESP_LOGW(TAG, "Invalid header: 0x%02X", raw[0]);
-
       // return false to reset buffer
       return false;
     }
-
     return true;
   }
 
@@ -129,7 +131,48 @@ bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
   }
 
   // data_len = number of ASCII payload bytes (from raw[1] .. raw[1 + data_len - 1])
-  uint16_t data_len = at - 4 - 1;
+  uint16_t data_len = static_cast<uint16_t>(at - 4 - 1);
+
+  // Quick sanity checks: payload length must be >= 2 (VER+ADDR...) and even (pairs of hex)
+  if (data_len < 2 || (data_len % 2) != 0) {
+    ESP_LOGW(TAG, "Invalid payload length (%u). Attempting resync...", data_len);
+    // Attempt to resync: find next '~' in buffer (skip current leading ~)
+    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
+      if (this->rx_buffer_[i] == 0x7E) {
+        // remove bytes up to the next '~'
+        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
+        return true; // continue parsing with trimmed buffer
+      }
+    }
+    // no next '~' found -> clear buffer
+    return false;
+  }
+
+  // Validate payload are ALL ASCII hex chars (0-9 A-F a-f)
+  bool valid_payload = true;
+  for (uint16_t i = 1; i <= data_len; ++i) {
+    uint8_t ch = raw[i];
+    bool is_hex = (ch >= '0' && ch <= '9') ||
+                  (ch >= 'A' && ch <= 'F') ||
+                  (ch >= 'a' && ch <= 'f');
+    if (!is_hex) {
+      valid_payload = false;
+      break;
+    }
+  }
+
+  if (!valid_payload) {
+    ESP_LOGW(TAG, "Non-hex char detected in payload. Attempting resync...");
+    // find the next '~' and shift buffer to it
+    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
+      if (this->rx_buffer_[i] == 0x7E) {
+        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
+        return true; // continue parsing
+      }
+    }
+    // no next '~' -> clear buffer
+    return false;
+  }
 
   // Remote CRC is encoded as 4 ASCII hex chars just before CR:
   // positions (at-4, at-3, at-2, at-1)
@@ -147,20 +190,34 @@ bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
 
   uint16_t computed_crc = 0;
   if (is_zte) {
+    // Compute ASCII-sum CRC over payload (raw[1] .. raw[1+data_len-1])
     computed_crc = zte_ascii_crc(raw + 1, data_len);
     ESP_LOGVV(TAG, "ZTE frame detected. ASCII-sum CRC computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
   } else {
+    // Use legacy chksum (bytes interpreted as already-converted binary)
     computed_crc = chksum(raw + 1, data_len);
     ESP_LOGVV(TAG, "Non-ZTE frame. generic chksum computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
   }
 
   if (computed_crc != remote_crc) {
-    ESP_LOGW(TAG, "CRC check failed! computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
+    // Dump a short hexdump for debugging (first 80 bytes max)
+    size_t dump_len = this->rx_buffer_.size() < 80 ? this->rx_buffer_.size() : 80;
+    ESP_LOGW(TAG, "CRC check failed! computed=0x%04X remote=0x%04X  raw (hex, first %u bytes): %s",
+             computed_crc, remote_crc, static_cast<unsigned>(dump_len),
+             format_hex_pretty(&this->rx_buffer_.front(), dump_len).c_str());
+    // Attempt resync to next '~' because data might be corrupted
+    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
+      if (this->rx_buffer_[i] == 0x7E) {
+        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
+        return true;
+      }
+    }
     return false;
   }
 
   // Convert ASCII hex payload to binary bytes (payload starts at raw[1], length = data_len)
   std::vector<uint8_t> data;
+  data.reserve(data_len / 2);
   for (uint16_t i = 1; i < data_len; i = i + 2) {
     data.push_back(ascii_hex_to_byte(raw[i], raw[i + 1]));
   }
@@ -181,10 +238,11 @@ bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
   }
 
   if (!found) {
-//    ESP_LOGW(TAG, "Got SeplosModbus frame from unknown address 0x%02X! ", address);
+    // Unknown address — keep quiet (original code commented out warning)
+    // ESP_LOGW(TAG, "Got SeplosModbus frame from unknown address 0x%02X! ", address);
   }
 
-  // return false to reset buffer
+  // return false to reset buffer (frame consumed)
   return false;
 }
 
@@ -208,17 +266,18 @@ void SeplosModbus::send(uint8_t protocol_version, uint8_t address, uint8_t funct
   data.push_back(address);           // ADDR
   data.push_back(0x46);              // CID1
   data.push_back(function);          // CID2 (0x42)
-  data.push_back(lenid >> 8);        // LCHKSUM (0xE0)
-  data.push_back(lenid >> 0);        // LENGTH (0x02)
-  data.push_back(value);             // VALUE (0x00)
+  data.push_back(lenid >> 8);        // LCHKSUM (high byte)
+  data.push_back(lenid >> 0);        // LENGTH (low byte)
+  data.push_back(value);             // VALUE
 
   const uint16_t frame_len = data.size();
   std::string payload = "~";  // SOF (0x7E)
   payload.append(byte_to_ascii_hex(data.data(), frame_len));
 
-  uint16_t crc = chksum((const uint8_t *) payload.data() + 1, payload.size() - 1);
-  data.push_back(crc >> 8);  // CHKSUM (high byte)
-  data.push_back(crc >> 0);  // CHKSUM (low byte)
+  // For sending keep using legacy chksum which is two's-complement of sum of bytes
+  uint16_t crc = chksum((const uint8_t *) payload.data() + 1, static_cast<uint16_t>(payload.size() - 1));
+  data.push_back(static_cast<uint8_t>(crc >> 8));  // CHKSUM high byte
+  data.push_back(static_cast<uint8_t>(crc & 0xFF));  // CHKSUM low byte
 
   payload.append(byte_to_ascii_hex(data.data() + frame_len, data.size() - frame_len));  // Append checksum
   payload.append("\r");                                                                 // EOF (0x0D)
