@@ -133,79 +133,9 @@ bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
   // data_len = number of ASCII payload bytes (from raw[1] .. raw[1 + data_len - 1])
   uint16_t data_len = static_cast<uint16_t>(at - 4 - 1);
 
-  // Quick sanity checks: payload length must be >= 2 (VER+ADDR...) and even (pairs of hex)
-  if (data_len < 2 || (data_len % 2) != 0) {
-    ESP_LOGW(TAG, "Invalid payload length (%u). Attempting resync...", data_len);
-    // Attempt to resync: find next '~' in buffer (skip current leading ~)
-    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
-      if (this->rx_buffer_[i] == 0x7E) {
-        // remove bytes up to the next '~'
-        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
-        return true; // continue parsing with trimmed buffer
-      }
-    }
-    // no next '~' found -> clear buffer
-    return false;
-  }
-
-  // Validate payload are ALL ASCII hex chars (0-9 A-F a-f)
-  bool valid_payload = true;
-  for (uint16_t i = 1; i <= data_len; ++i) {
-    uint8_t ch = raw[i];
-    bool is_hex = (ch >= '0' && ch <= '9') ||
-                  (ch >= 'A' && ch <= 'F') ||
-                  (ch >= 'a' && ch <= 'f');
-    if (!is_hex) {
-      valid_payload = false;
-      break;
-    }
-  }
-
-  if (!valid_payload) {
-    ESP_LOGW(TAG, "Non-hex char detected in payload. Attempting resync...");
-    // find the next '~' and shift buffer to it
-    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
-      if (this->rx_buffer_[i] == 0x7E) {
-        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
-        return true; // continue parsing
-      }
-    }
-    // no next '~' -> clear buffer
-    return false;
-  }
-
-  // Remote CRC is encoded as 4 ASCII hex chars just before CR:
-  // positions (at-4, at-3, at-2, at-1)
-  uint16_t remote_crc = uint16_t(ascii_hex_to_byte(raw[at - 4], raw[at - 3])) << 8 |
-                        (uint16_t(ascii_hex_to_byte(raw[at - 2], raw[at - 1])) << 0);
-
-  // Detect ZTE frames (they typically start with "~21...")
-  bool is_zte = false;
-  if (data_len >= 2) {
-    // raw[1] and raw[2] are ASCII chars
-    if (raw[1] == '2' && raw[2] == '1') {
-      is_zte = true;
-    }
-  }
-
-  uint16_t computed_crc = 0;
-  if (is_zte) {
-    // Compute ASCII-sum CRC over payload (raw[1] .. raw[1+data_len-1])
-    computed_crc = zte_ascii_crc(raw + 1, data_len);
-    ESP_LOGVV(TAG, "ZTE frame detected. ASCII-sum CRC computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
-  } else {
-    // Use legacy chksum (bytes interpreted as already-converted binary)
-    computed_crc = chksum(raw + 1, data_len);
-    ESP_LOGVV(TAG, "Non-ZTE frame. generic chksum computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
-  }
-
-  if (computed_crc != remote_crc) {
-    // Dump a short hexdump for debugging (first 80 bytes max)
-    size_t dump_len = this->rx_buffer_.size() < 80 ? this->rx_buffer_.size() : 80;
-    ESP_LOGW(TAG, "CRC check failed! computed=0x%04X remote=0x%04X  raw (hex, first %u bytes): %s",
-             computed_crc, remote_crc, static_cast<unsigned>(dump_len),
-             format_hex_pretty(&this->rx_buffer_.front(), dump_len).c_str());
-    // Attempt resync to next '~' because data might be corrupted
+  // If payload length is obviously invalid (too short / odd) try quick resync
+  if (data_len < 2) {
+    ESP_LOGV(TAG, "Payload too short (%u). Resyncing...", data_len);
     for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
       if (this->rx_buffer_[i] == 0x7E) {
         this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
@@ -215,11 +145,83 @@ bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
     return false;
   }
 
-  // Convert ASCII hex payload to binary bytes (payload starts at raw[1], length = data_len)
+  // Build cleaned payload: keep only hex ASCII chars from raw[1] .. raw[at-5]
+  std::string cleaned;
+  cleaned.reserve(data_len);
+  for (uint16_t i = 1; i <= data_len; ++i) {
+    uint8_t ch = raw[i];
+    if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f')) {
+      cleaned.push_back(static_cast<char>(ch));
+    }
+  }
+
+  // If cleaning removed some bytes, log at verbose level only
+  if (cleaned.size() != data_len) {
+    ESP_LOGV(TAG, "Cleaned payload: original_len=%u cleaned_len=%u", data_len, (unsigned)cleaned.size());
+  }
+
+  // Cleaned must be even length and at least 2 bytes (VER+ADDR)
+  if (cleaned.empty() || (cleaned.size() < 2) || (cleaned.size() % 2 != 0)) {
+    ESP_LOGV(TAG, "Payload cleaning failed (len=%u -> cleaned=%u). Attempting resync...", data_len, (unsigned)cleaned.size());
+    // attempt to resync to next '~'
+    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
+      if (this->rx_buffer_[i] == 0x7E) {
+        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Remote CRC is encoded as 4 ASCII hex chars just before CR:
+  // positions (at-4, at-3, at-2, at-1)
+  uint16_t remote_crc = uint16_t(ascii_hex_to_byte(raw[at - 4], raw[at - 3])) << 8 |
+                        (uint16_t(ascii_hex_to_byte(raw[at - 2], raw[at - 1])) << 0);
+
+  // Detect ZTE frames using cleaned[0..1] (they typically start with "~21...")
+  bool is_zte = false;
+  if (cleaned.size() >= 2) {
+    if (cleaned[0] == '2' && cleaned[1] == '1') {
+      is_zte = true;
+    }
+  }
+
+  uint16_t computed_crc = 0;
+  if (is_zte) {
+    // Compute ASCII-sum CRC over cleaned payload ascii bytes
+    computed_crc = zte_ascii_crc(reinterpret_cast<const uint8_t *>(cleaned.data()), static_cast<uint16_t>(cleaned.size()));
+    ESP_LOGVV(TAG, "ZTE frame detected. ASCII-sum CRC computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
+  } else {
+    // For non-ZTE frames compute chksum on binary bytes -> convert cleaned to binary first
+    std::vector<uint8_t> binary;
+    binary.reserve(cleaned.size() / 2);
+    for (size_t i = 0; i + 1 < cleaned.size(); i += 2)
+      binary.push_back(ascii_hex_to_byte(cleaned[i], cleaned[i + 1]));
+    computed_crc = chksum(binary.data(), static_cast<uint16_t>(binary.size()));
+    ESP_LOGVV(TAG, "Non-ZTE frame. generic chksum computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
+  }
+
+  if (computed_crc != remote_crc) {
+    // CRC failure — keep as warning but with limited hexdump to avoid spamming logs
+    size_t dump_len = this->rx_buffer_.size() < 48 ? this->rx_buffer_.size() : 48;
+    ESP_LOGW(TAG, "CRC check failed! computed=0x%04X remote=0x%04X  raw (hex, first %u bytes): %s",
+             computed_crc, remote_crc, static_cast<unsigned>(dump_len),
+             format_hex_pretty(&this->rx_buffer_.front(), dump_len).c_str());
+    // attempt resync to next '~'
+    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
+      if (this->rx_buffer_[i] == 0x7E) {
+        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Convert cleaned ASCII hex payload to binary bytes (pairs)
   std::vector<uint8_t> data;
-  data.reserve(data_len / 2);
-  for (uint16_t i = 1; i < data_len; i = i + 2) {
-    data.push_back(ascii_hex_to_byte(raw[i], raw[i + 1]));
+  data.reserve(cleaned.size() / 2);
+  for (size_t i = 0; i + 1 < cleaned.size(); i += 2) {
+    data.push_back(ascii_hex_to_byte(cleaned[i], cleaned[i + 1]));
   }
 
   // NOTE: In the data vector, position mapping assumed by original code:
