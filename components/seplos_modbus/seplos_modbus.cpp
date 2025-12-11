@@ -146,8 +146,9 @@ if (computed_crc != remote_crc) {
 //    ESP_LOGW(TAG, "Got SeplosModbus frame from unknown address 0x%02X! ", address);
   }
 
-  // return false to reset buffer
-  return false;
+  // clear buffer for next frame
+  this->rx_buffer_.clear();
+  return true;
 }
 
 void SeplosModbus::dump_config() {
