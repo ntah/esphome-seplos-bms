@@ -1,7 +1,5 @@
 #include "seplos_modbus.h"
 #include "esphome/core/log.h"
-#include "esphome/core/helpers.h"
-#include <ctype.h>
 
 namespace esphome {
 namespace seplos_modbus {
@@ -9,15 +7,15 @@ namespace seplos_modbus {
 static const char *const TAG = "seplos_modbus";
 
 /**
- * Compute CRC16 (Modbus ASCII style, NOT RTU)
+ * CRC16 (already declared in .h)
  */
-uint16_t SeplosModbus::crc16_(const uint8_t *buffer, uint16_t length) {
+uint16_t crc16(const uint8_t *data, uint8_t len) {
   uint16_t crc = 0xFFFF;
 
-  for (uint16_t i = 0; i < length; i++) {
-    crc ^= buffer[i];
+  for (uint8_t i = 0; i < len; i++) {
+    crc ^= data[i];
     for (uint8_t j = 0; j < 8; j++) {
-      if (crc & 0x0001)
+      if (crc & 1)
         crc = (crc >> 1) ^ 0xA001;
       else
         crc >>= 1;
@@ -26,123 +24,120 @@ uint16_t SeplosModbus::crc16_(const uint8_t *buffer, uint16_t length) {
   return crc;
 }
 
-/**
- * Send a Modbus ASCII frame to ZTE/Seplos BMS
- */
-void SeplosModbus::send(uint8_t address, uint8_t function, uint16_t value) {
-  this->expected_addr_ = address;
-  this->expected_cid1_ = 0x46;        // Always 46 for ZTE/Seplos
-  this->expected_cid2_ = function;    // Example 0x42
-
-  char frame[32];
-  uint8_t raw[4];
-  raw[0] = 0x21;      // Header '~' already added by UART debug
-  raw[1] = address;
-  raw[2] = 0x46;
-  raw[3] = function;
-
-  uint16_t crc = this->crc16_(raw, 4);
-  uint16_t crc_be = (crc >> 8) | (crc << 8);
-
-  sprintf(frame,
-          "~%02X%02X%02X%02X%04X\r",
-          raw[0], raw[1], raw[2], raw[3], crc_be);
-
-  ESP_LOGD(TAG, "TX: %s", frame);
-  this->parent_->write_str(frame);
+void SeplosModbus::setup() {
+  ESP_LOGCONFIG(TAG, "Setting up SeplosModbus...");
 }
 
 /**
- * Parse single character (Modbus ASCII stream parser)
+ * SEND FRAME (original API preserved)
+ */
+void SeplosModbus::send(uint8_t protocol_version, uint8_t address, uint8_t function, uint8_t value) {
+  this->last_send_ = millis();
+
+  uint8_t payload[4];
+  payload[0] = protocol_version;   // usually 0x21
+  payload[1] = address;
+  payload[2] = 0x46;
+  payload[3] = function;
+
+  uint16_t crc = crc16(payload, 4);
+  uint16_t crc_swap = (crc >> 8) | (crc << 8);
+
+  char frame[32];
+  sprintf(frame, "~%02X%02X%02X%02X%04X\r",
+          payload[0], payload[1], payload[2], payload[3], crc_swap);
+
+  ESP_LOGD(TAG, "TX: %s", frame);
+  this->write_str(frame);
+}
+
+/**
+ * PARSE BYTE RX (ASCII HEX Modbus)
  */
 bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t c) {
-  const uint32_t now = millis();
+  uint32_t now = millis();
 
-  if (now - this->last_rx_ts_ > this->rx_timeout_) {
+  if (now - this->last_seplos_modbus_byte_ > this->rx_timeout_) {
     this->rx_buffer_.clear();
   }
-  this->last_rx_ts_ = now;
 
-  // Start of frame '~'
+  this->last_seplos_modbus_byte_ = now;
+
   if (c == '~') {
     this->rx_buffer_.clear();
     this->rx_buffer_.push_back(c);
     return false;
   }
 
-  // Accumulate
   this->rx_buffer_.push_back(c);
 
-  // Frame ends with '\r'
   if (c != '\r')
     return false;
 
-  // Clean ASCII hex payload
+  // CLEAN ASCII HEX
   std::string hex;
-  hex.reserve(rx_buffer_.size());
-
-  for (char ch : rx_buffer_) {
+  for (auto ch : this->rx_buffer_) {
     if (isxdigit(ch))
       hex.push_back(ch);
   }
 
-  if (hex.length() < 10) {
-    ESP_LOGW(TAG, "Frame too short (len=%u)", (unsigned)hex.length());
+  if (hex.length() < 12) {
+    ESP_LOGW(TAG, "Frame too short: %s", hex.c_str());
     return false;
   }
 
-  // Convert ASCII hex → binary
-  const size_t len = hex.length() / 2;
+  size_t len = hex.length() / 2;
   std::vector<uint8_t> data(len);
 
   for (size_t i = 0; i < len; i++) {
     char hi = hex[i * 2];
     char lo = hex[i * 2 + 1];
-    data[i] = (uint8_t) strtol((std::string()+hi+lo).c_str(), nullptr, 16);
+    data[i] = (uint8_t) strtol((std::string() + hi + lo).c_str(), nullptr, 16);
   }
 
-  if (len < 6) {
-    ESP_LOGW(TAG, "Invalid binary length (%u)", (unsigned)len);
+  if (len < 6)
     return false;
-  }
 
-  uint8_t addr = data[1];
-  uint8_t cid1 = data[2];
-  uint8_t cid2 = data[3];
+  uint8_t protocol = data[0];
+  uint8_t addr     = data[1];
+  uint8_t cid1     = data[2];
+  uint8_t cid2     = data[3];
 
-  // Compute CRC
+  // CRC CHECK
   uint16_t remote_crc = ((uint16_t)data[len-2] << 8) | data[len-1];
-  uint16_t calc_crc   = crc16_(data.data(), len - 2);
+  uint16_t calc_crc = crc16(data.data(), len - 2);
 
   if (remote_crc != calc_crc) {
-    ESP_LOGW(TAG, "CRC mismatch remote=0x%04X calc=0x%04X", remote_crc, calc_crc);
+    ESP_LOGW(TAG, "CRC error: remote=0x%04X calc=0x%04X", remote_crc, calc_crc);
     return false;
   }
 
-  // MODE A FILTER:
-  // Accept telemetry (CID2=00) OR reply (CID2=expected)
-  bool cid2_valid =
-      (cid2 == 0x00) ||        // Telemetry data frame
-      (cid2 == this->expected_cid2_);
+  // FILTER MODE A
+  for (auto *dev : this->devices_) {
+    if (dev->address_ != addr)
+      continue;  // ignore other addresses
 
-  if (addr != this->expected_addr_ || cid1 != this->expected_cid1_ || !cid2_valid) {
-    ESP_LOGV(TAG, "Ignoring frame ADDR=0x%02X CID1=0x%02X CID2=0x%02X "
-                  "(expect ADDR=0x%02X CID1=0x%02X CID2=%02X or telemetry CID2=00)",
-             addr, cid1, cid2,
-             this->expected_addr_, this->expected_cid1_, this->expected_cid2_);
-    return false;
+    if (cid1 != 0x46)
+      continue; // Seplos/ZTE always uses 0x46
+
+    bool cid2_valid =
+        (cid2 == 0x00) ||          // telemetry
+        (cid2 == dev->protocol_version_); // reply (protocol_version holds CID2 expected)
+
+    if (!cid2_valid) {
+      ESP_LOGV(TAG,
+               "Ignoring frame A=0x%02X CID1=0x%02X CID2=0x%02X (expected CID2=%02X or 00)",
+               addr, cid1, cid2, dev->protocol_version_);
+      continue;
+    }
+
+    // VALID FRAME → forward to correct device
+    dev->on_seplos_modbus_data(data);
   }
-
-  // Valid data → forward to device
-  if (this->device_ != nullptr)
-    this->device_->on_seplos_modbus_data(data);
 
   return true;
 }
 
-/**
- * UART on_receive()
- */
 void SeplosModbus::loop() {
   uint8_t c;
   while (this->available()) {
@@ -151,19 +146,11 @@ void SeplosModbus::loop() {
   }
 }
 
-/**
- * Config dump (required)
- */
 void SeplosModbus::dump_config() {
   ESP_LOGCONFIG(TAG, "SeplosModbus:");
   ESP_LOGCONFIG(TAG, "  RX Timeout: %u ms", this->rx_timeout_);
-  if (this->flow_control_pin_)
-    LOG_PIN("  Flow Control Pin: ", this->flow_control_pin_);
 }
 
-/**
- * Setup priority (required)
- */
 float SeplosModbus::get_setup_priority() const {
   return setup_priority::BUS - 1.0f;
 }
