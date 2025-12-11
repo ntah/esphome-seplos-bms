@@ -9,282 +9,186 @@ static const char *const TAG = "seplos_modbus";
 
 static const uint16_t MAX_RESPONSE_SIZE = 340;
 
+// =============================
+// TRACK LAST REQUEST (REPLY FILTER)
+// =============================
+uint8_t expected_addr_  = 0xFF;
+uint8_t expected_cid1_  = 0xFF;
+uint8_t expected_cid2_  = 0xFF;
+
 void SeplosModbus::setup() {
-  if (this->flow_control_pin_ != nullptr) {
+  if (this->flow_control_pin_ != nullptr)
     this->flow_control_pin_->setup();
-  }
 }
+
 void SeplosModbus::loop() {
   const uint32_t now = millis();
 
   if (now - this->last_seplos_modbus_byte_ > this->rx_timeout_) {
-    if (!this->rx_buffer_.empty()) {
-      ESP_LOGVV(TAG, "Buffer cleared due to timeout: %s",
-                format_hex_pretty(&this->rx_buffer_.front(), this->rx_buffer_.size()).c_str());
-      this->rx_buffer_.clear();
-    }
+    this->rx_buffer_.clear();
     this->last_seplos_modbus_byte_ = now;
   }
 
   while (this->available()) {
     uint8_t byte;
     this->read_byte(&byte);
-    if (this->parse_seplos_modbus_byte_(byte)) {
+    if (!this->parse_seplos_modbus_byte_(byte))
+      this->rx_buffer_.clear();
+    else
       this->last_seplos_modbus_byte_ = now;
-    } else {
-      if (!this->rx_buffer_.empty()) {
-        ESP_LOGVV(TAG, "Buffer cleared due to reset: %s",
-                  format_hex_pretty(&this->rx_buffer_.front(), this->rx_buffer_.size()).c_str());
-        this->rx_buffer_.clear();
-      }
-    }
   }
 }
 
-/**
- * Existing checksum function (kept for non-ZTE frames).
- * This computes two's-complement of the sum of bytes in 'data' (i.e. ~sum + 1).
- */
+// CHKSUM — legacy checksum used for outgoing frames
 uint16_t chksum(const uint8_t data[], const uint16_t len) {
   uint32_t checksum = 0;
-  for (uint16_t i = 0; i < len; i++) {
+  for (uint16_t i = 0; i < len; i++)
     checksum += data[i];
-  }
-  checksum = ~checksum;
-  checksum += 1;
-  return static_cast<uint16_t>(checksum & 0xFFFF);
+  checksum = ~checksum + 1;
+  return uint16_t(checksum & 0xFFFF);
 }
 
-/**
- * ZTE-specific checksum:
- * Compute sum of ASCII bytes from payload (not the interpreted hex bytes),
- * then return (0x10000 - (sum & 0xFFFF)) & 0xFFFF.
- *
- * This is equivalent to two's-complement negation of the 16-bit sum.
- */
-uint16_t zte_ascii_crc(const uint8_t data[], const uint16_t len) {
+// ZTE ASCII SUM CRC
+uint16_t zte_ascii_crc(const uint8_t *data, uint16_t len) {
   uint32_t sum = 0;
-  for (uint16_t i = 0; i < len; i++) {
+  for (uint16_t i = 0; i < len; i++)
     sum += data[i];
-  }
-  uint16_t sum16 = static_cast<uint16_t>(sum & 0xFFFF);
-  return static_cast<uint16_t>((0x10000 - sum16) & 0xFFFF);
-}
-
-/**
- * length checksum helper used when sending frames (unchanged).
- */
-uint16_t lchksum(const uint16_t len) {
-  uint16_t lchecksum = 0x0000;
-
-  if (len == 0)
-    return 0x0000;
-
-  lchecksum = (len & 0xf) + ((len >> 4) & 0xf) + ((len >> 8) & 0xf);
-  lchecksum = ~(lchecksum % 16) + 1;
-
-  return (lchecksum << 12) + len;  // 4 nibble checksum + 12 bits length
+  return uint16_t((0x10000 - (sum & 0xFFFF)) & 0xFFFF);
 }
 
 uint8_t ascii_hex_to_byte(char a, char b) {
   a = (a <= '9') ? a - '0' : (a & 0x7) + 9;
   b = (b <= '9') ? b - '0' : (b & 0x7) + 9;
-
-  return (a << 4) + b;
-}
-
-static char byte_to_ascii_hex(uint8_t v) { return v >= 10 ? 'A' + (v - 10) : '0' + v; }
-std::string byte_to_ascii_hex(const uint8_t *data, size_t length) {
-  if (length == 0)
-    return "";
-  std::string ret;
-  ret.resize(2 * length);
-  for (size_t i = 0; i < length; i++) {
-    ret[2 * i] = byte_to_ascii_hex((data[i] & 0xF0) >> 4);
-    ret[2 * i + 1] = byte_to_ascii_hex(data[i] & 0x0F);
-  }
-  return ret;
+  return (a << 4) | b;
 }
 
 bool SeplosModbus::parse_seplos_modbus_byte_(uint8_t byte) {
+
   size_t at = this->rx_buffer_.size();
   this->rx_buffer_.push_back(byte);
   const uint8_t *raw = &this->rx_buffer_[0];
 
-  // Start of frame
+  // Start
   if (at == 0) {
-    if (raw[0] != 0x7E) {
-      ESP_LOGW(TAG, "Invalid header: 0x%02X", raw[0]);
-      // return false to reset buffer
+    if (raw[0] != 0x7E)
       return false;
-    }
     return true;
   }
 
-  // End of frame '\r'
+  // Not end yet
   if (raw[at] != 0x0D)
     return true;
 
-  if (at > MAX_RESPONSE_SIZE) {
-    ESP_LOGW(TAG, "Maximum response size exceeded. Flushing RX buffer...");
+  // Too long
+  if (at > MAX_RESPONSE_SIZE)
     return false;
-  }
 
-  // data_len = number of ASCII payload bytes (from raw[1] .. raw[1 + data_len - 1])
-  uint16_t data_len = static_cast<uint16_t>(at - 4 - 1);
+  uint16_t data_len = at - 5;
 
-  // If payload length is obviously invalid (too short / odd) try quick resync
-  if (data_len < 2) {
-    ESP_LOGV(TAG, "Payload too short (%u). Resyncing...", data_len);
-    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
-      if (this->rx_buffer_[i] == 0x7E) {
-        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // Build cleaned payload: keep only hex ASCII chars from raw[1] .. raw[at-5]
+  // Clean ASCII hex payload
   std::string cleaned;
-  cleaned.reserve(data_len);
-  for (uint16_t i = 1; i <= data_len; ++i) {
-    uint8_t ch = raw[i];
-    if ((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f')) {
-      cleaned.push_back(static_cast<char>(ch));
-    }
+  for (uint16_t i = 1; i <= data_len; i++) {
+    char c = raw[i];
+    if ((c >= '0' && c <= '9') ||
+        (c >= 'A' && c <= 'F') ||
+        (c >= 'a' && c <= 'f'))
+      cleaned.push_back(c);
   }
 
-  // If cleaning removed some bytes, log at verbose level only
-  if (cleaned.size() != data_len) {
-    ESP_LOGV(TAG, "Cleaned payload: original_len=%u cleaned_len=%u", data_len, (unsigned)cleaned.size());
-  }
-
-  // Cleaned must be even length and at least 2 bytes (VER+ADDR)
-  if (cleaned.empty() || (cleaned.size() < 2) || (cleaned.size() % 2 != 0)) {
-    ESP_LOGV(TAG, "Payload cleaning failed (len=%u -> cleaned=%u). Attempting resync...", data_len, (unsigned)cleaned.size());
-    // attempt to resync to next '~'
-    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
-      if (this->rx_buffer_[i] == 0x7E) {
-        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
-        return true;
-      }
-    }
+  if (cleaned.size() < 4 || cleaned.size() % 2 != 0)
     return false;
-  }
 
-  // Remote CRC is encoded as 4 ASCII hex chars just before CR:
-  // positions (at-4, at-3, at-2, at-1)
-  uint16_t remote_crc = uint16_t(ascii_hex_to_byte(raw[at - 4], raw[at - 3])) << 8 |
-                        (uint16_t(ascii_hex_to_byte(raw[at - 2], raw[at - 1])) << 0);
+  // Decode remote CRC
+  uint16_t remote_crc =
+      (ascii_hex_to_byte(raw[at - 4], raw[at - 3]) << 8) |
+      (ascii_hex_to_byte(raw[at - 2], raw[at - 1]) << 0);
 
-  // Detect ZTE frames using cleaned[0..1] (they typically start with "~21...")
-  bool is_zte = false;
-  if (cleaned.size() >= 2) {
-    if (cleaned[0] == '2' && cleaned[1] == '1') {
-      is_zte = true;
-    }
-  }
+  // Detect ZTE frame (starts with "21")
+  bool is_zte = cleaned[0] == '2' && cleaned[1] == '1';
 
   uint16_t computed_crc = 0;
   if (is_zte) {
-    // Compute ASCII-sum CRC over cleaned payload ascii bytes
-    computed_crc = zte_ascii_crc(reinterpret_cast<const uint8_t *>(cleaned.data()), static_cast<uint16_t>(cleaned.size()));
-    ESP_LOGVV(TAG, "ZTE frame detected. ASCII-sum CRC computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
+    computed_crc = zte_ascii_crc(reinterpret_cast<const uint8_t *>(cleaned.data()),
+                                 cleaned.size());
   } else {
-    // For non-ZTE frames compute chksum on binary bytes -> convert cleaned to binary first
     std::vector<uint8_t> binary;
-    binary.reserve(cleaned.size() / 2);
-    for (size_t i = 0; i + 1 < cleaned.size(); i += 2)
+    for (int i = 0; i < cleaned.size(); i += 2)
       binary.push_back(ascii_hex_to_byte(cleaned[i], cleaned[i + 1]));
-    computed_crc = chksum(binary.data(), static_cast<uint16_t>(binary.size()));
-    ESP_LOGVV(TAG, "Non-ZTE frame. generic chksum computed=0x%04X remote=0x%04X", computed_crc, remote_crc);
+    computed_crc = chksum(binary.data(), binary.size());
   }
 
-  if (computed_crc != remote_crc) {
-    // CRC failure — keep as warning but with limited hexdump to avoid spamming logs
-    size_t dump_len = this->rx_buffer_.size() < 48 ? this->rx_buffer_.size() : 48;
-    ESP_LOGW(TAG, "CRC check failed! computed=0x%04X remote=0x%04X  raw (hex, first %u bytes): %s",
-             computed_crc, remote_crc, static_cast<unsigned>(dump_len),
-             format_hex_pretty(&this->rx_buffer_.front(), dump_len).c_str());
-    // attempt resync to next '~'
-    for (size_t i = 1; i < this->rx_buffer_.size(); ++i) {
-      if (this->rx_buffer_[i] == 0x7E) {
-        this->rx_buffer_.erase(this->rx_buffer_.begin(), this->rx_buffer_.begin() + i);
-        return true;
-      }
-    }
+  if (computed_crc != remote_crc)
+    return false;
+
+  // Convert cleaned ASCII to binary
+  std::vector<uint8_t> data;
+  for (int i = 0; i < cleaned.size(); i += 2)
+    data.push_back(ascii_hex_to_byte(cleaned[i], cleaned[i + 1]));
+
+  // Extract ADDR + CID1 + CID2
+  if (data.size() < 4)
+    return false;
+
+  uint8_t addr = data[1];
+  uint8_t cid1 = data[2];
+  uint8_t cid2 = data[3];
+
+  // =============================
+  //   REPLY FILTER CHECK HERE!
+  // =============================
+  if (addr != expected_addr_ ||
+      cid1 != expected_cid1_ ||
+      cid2 != expected_cid2_) {
+    ESP_LOGV(TAG,
+      "Ignoring frame: ADDR=0x%02X CID1=0x%02X CID2=0x%02X (waiting reply for ADDR=0x%02X CID1=0x%02X CID2=0x%02X)",
+      addr, cid1, cid2,
+      expected_addr_, expected_cid1_, expected_cid2_);
     return false;
   }
 
-  // Convert cleaned ASCII hex payload to binary bytes (pairs)
-  std::vector<uint8_t> data;
-  data.reserve(cleaned.size() / 2);
-  for (size_t i = 0; i + 1 < cleaned.size(); i += 2) {
-    data.push_back(ascii_hex_to_byte(cleaned[i], cleaned[i + 1]));
-  }
-
-  // NOTE: In the data vector, position mapping assumed by original code:
-  // data[0] = VER, data[1] = ADDR, data[2] = CID1, data[3] = CID2, ...
-  uint8_t address = 0xFF;
-  if (data.size() > 1) {
-    address = data[1];
-  }
-
-  bool found = false;
+  // Dispatch to matching device
   for (auto *device : this->devices_) {
-    if (device->address_ == address) {
+    if (device->address_ == addr)
       device->on_seplos_modbus_data(data);
-      found = true;
-    }
   }
 
-  if (!found) {
-    // Unknown address — keep quiet (original code commented out warning)
-    // ESP_LOGW(TAG, "Got SeplosModbus frame from unknown address 0x%02X! ", address);
-  }
-
-  // return false to reset buffer (frame consumed)
   return false;
 }
 
-void SeplosModbus::dump_config() {
-  ESP_LOGCONFIG(TAG, "SeplosModbus:");
-  LOG_PIN("  Flow Control Pin: ", this->flow_control_pin_);
-  ESP_LOGCONFIG(TAG, "  RX timeout: %d ms", this->rx_timeout_);
-}
-float SeplosModbus::get_setup_priority() const {
-  // After UART bus
-  return setup_priority::BUS - 1.0f;
-}
-
 void SeplosModbus::send(uint8_t protocol_version, uint8_t address, uint8_t function, uint8_t value) {
+
+  // Save request signature for reply filter
+  expected_addr_ = address;
+  expected_cid1_ = 0x46;
+  expected_cid2_ = function;
+
   if (this->flow_control_pin_ != nullptr)
     this->flow_control_pin_->digital_write(true);
 
-  const uint16_t lenid = lchksum(1 * 2);
+  const uint16_t lenid = 0xE002;
   std::vector<uint8_t> data;
-  data.push_back(protocol_version);  // VER
-  data.push_back(address);           // ADDR
-  data.push_back(0x46);              // CID1
-  data.push_back(function);          // CID2 (0x42)
-  data.push_back(lenid >> 8);        // LCHKSUM (high byte)
-  data.push_back(lenid >> 0);        // LENGTH (low byte)
-  data.push_back(value);             // VALUE
 
-  const uint16_t frame_len = data.size();
-  std::string payload = "~";  // SOF (0x7E)
-  payload.append(byte_to_ascii_hex(data.data(), frame_len));
+  data.push_back(protocol_version);
+  data.push_back(address);
+  data.push_back(0x46);
+  data.push_back(function);
+  data.push_back(lenid >> 8);
+  data.push_back(lenid & 0xFF);
+  data.push_back(value);
 
-  // For sending keep using legacy chksum which is two's-complement of sum of bytes
-  uint16_t crc = chksum((const uint8_t *) payload.data() + 1, static_cast<uint16_t>(payload.size() - 1));
-  data.push_back(static_cast<uint8_t>(crc >> 8));  // CHKSUM high byte
-  data.push_back(static_cast<uint8_t>(crc & 0xFF));  // CHKSUM low byte
+  std::string payload = "~";
+  for (auto b : data)
+    payload.push_back("0123456789ABCDEF"[b >> 4]),
+    payload.push_back("0123456789ABCDEF"[b & 0x0F]);
 
-  payload.append(byte_to_ascii_hex(data.data() + frame_len, data.size() - frame_len));  // Append checksum
-  payload.append("\r");                                                                 // EOF (0x0D)
+  uint16_t crc = chksum((const uint8_t *) payload.c_str() + 1, payload.size() - 1);
+  payload.push_back("0123456789ABCDEF"[crc >> 12 & 0xF]);
+  payload.push_back("0123456789ABCDEF"[crc >> 8 & 0xF]);
+  payload.push_back("0123456789ABCDEF"[crc >> 4 & 0xF]);
+  payload.push_back("0123456789ABCDEF"[crc & 0xF]);
+  payload.push_back('\r');
 
-  ESP_LOGD(TAG, "Send frame: %s", payload.c_str());
+  ESP_LOGD(TAG, "SEND → %s", payload.c_str());
 
   this->write_str(payload.c_str());
   this->flush();
@@ -293,5 +197,5 @@ void SeplosModbus::send(uint8_t protocol_version, uint8_t address, uint8_t funct
     this->flow_control_pin_->digital_write(false);
 }
 
-}  // namespace seplos_modbus
-}  // namespace esphome
+} // namespace seplos_modbus
+} // namespace esphome
