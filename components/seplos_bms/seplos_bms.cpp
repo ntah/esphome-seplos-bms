@@ -271,8 +271,6 @@ void SeplosBms::on_zte_fb101_(const std::vector<uint8_t> &data) {
   // SOH = full_cap / rated_capacity * 100
   // (safe guard rated_capacity > 0)
   // -----------------------
-  uint16_t soh_raw = zte_u16(54);
-  float soh = soh_raw / 100.0f;
   if (this->state_of_health_sensor_ != nullptr) this->publish_state_(this->state_of_health_sensor_, soh);
 
   // -----------------------
@@ -393,8 +391,6 @@ void SeplosBms::on_zte_fb100c1_(const std::vector<uint8_t> &data) {
   // =========================
   // SOH (%)
   // =========================
-  uint16_t soh_raw = u16(54);
-  float soh = soh_raw / 100.0f;
   if (this->state_of_health_sensor_) this->publish_state_(this->state_of_health_sensor_, soh);
 
   // =========================
