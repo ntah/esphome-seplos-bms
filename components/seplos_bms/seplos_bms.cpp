@@ -259,14 +259,13 @@ void SeplosBms::on_zte_fb101_(const std::vector<uint8_t> &data) {
   float current = cur_raw / 100.0f;
   if (this->current_sensor_ != nullptr) this->publish_state_(this->current_sensor_, current);
 
-  // -----------------------
-  // FULL CAPACITY (raw -> Ah). Use empiric decode factor (52.8) derived
-  // from observed raw->Ah pairs. If you want different decode, tweak factor.
-  // -----------------------
-  uint16_t cap_raw = zte_u16(47);
-  const float DECODE_CAP_FACTOR = 52.8f;
-  float full_cap = cap_raw / DECODE_CAP_FACTOR;
-  if (this->battery_capacity_sensor_ != nullptr) this->publish_state_(this->battery_capacity_sensor_, full_cap);
+  // FULL CAPACITY = SOH% × 1Ah
+  uint16_t soh_raw = zte_u16(54);
+  float soh = soh_raw / 100.0f;
+  float full_cap = soh;   // langsung Ah
+
+  if (this->battery_capacity_sensor_ != nullptr)
+    this->publish_state_(this->battery_capacity_sensor_, full_cap);
 
   // -----------------------
   // SOH = full_cap / rated_capacity * 100
@@ -387,9 +386,9 @@ void SeplosBms::on_zte_fb100c1_(const std::vector<uint8_t> &data) {
   // =========================
   // FULL CAPACITY
   // =========================
-  uint16_t cap_raw = u16(47);
-  float full_cap = cap_raw / 52.8f;   // faktor empiris FB100/FB101
-  if (this->battery_capacity_sensor_) this->publish_state_(this->battery_capacity_sensor_, full_cap);
+  uint16_t soh_raw = u16(54);
+  float soh = soh_raw / 100.0f;
+  float full_cap = soh;  // SOH% = Ah
 
   // =========================
   // SOH (%)
