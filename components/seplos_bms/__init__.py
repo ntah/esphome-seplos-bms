@@ -3,6 +3,7 @@ from esphome.components import seplos_modbus
 import esphome.config_validation as cv
 from esphome.const import CONF_ID
 
+CONF_TIPE = "tipe"
 AUTO_LOAD = ["seplos_modbus", "binary_sensor", "sensor", "text_sensor"]
 CODEOWNERS = ["@syssi"]
 MULTI_CONF = True
@@ -28,9 +29,8 @@ CONFIG_SCHEMA = (
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(SeplosBms),
-            cv.Optional(CONF_OVERRIDE_CELL_COUNT, default=0): cv.int_range(
-                min=0, max=16
-            ),
+            cv.Optional(CONF_OVERRIDE_CELL_COUNT, default=0): cv.int_range(min=0, max=16),
+            cv.Optional(CONF_TIPE, default="fb101"): cv.string, 
         }
     )
     .extend(cv.polling_component_schema("10s"))
@@ -48,3 +48,7 @@ async def to_code(config):
     await seplos_modbus.register_seplos_modbus_device(var, config)
 
     cg.add(var.set_override_cell_count(config[CONF_OVERRIDE_CELL_COUNT]))
+
+    if CONF_TIPE in config:
+        cg.add(var.set_tipe(config[CONF_TIPE]))
+
