@@ -17,13 +17,18 @@ void SeplosModbus::setup() {
 void SeplosModbus::loop() {
   const uint32_t now = millis();
 
-  if (now - this->last_seplos_modbus_byte_ > this->rx_timeout_) {
-    ESP_LOGVV(TAG, "Buffer cleared due to timeout: %s",
-              format_hex_pretty(&this->rx_buffer_.front(), this->rx_buffer_.size()).c_str());
-    this->rx_buffer_.clear();
-    this->last_seplos_modbus_byte_ = now;
+  // ZTE FB101/FB100C1 send frames in 2 bursts separated by 5–25 ms.
+  // Give enough time for the full frame to arrive.
+  if (now - this->last_seplos_modbus_byte_ > 60) {   // was rx_timeout_ (2–5 ms)
+      if (!this->rx_buffer_.empty()) {
+          ESP_LOGVV(TAG, "Timeout reached — forcing frame parse");
+          // Force parse by injecting '\r'
+          this->parse_seplos_modbus_byte_('\r');
+      }
+      this->rx_buffer_.clear();
+      this->last_seplos_modbus_byte_ = now;
   }
-
+  
   while (this->available()) {
     uint8_t byte;
     this->read_byte(&byte);
