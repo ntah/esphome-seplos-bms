@@ -206,7 +206,7 @@ void SeplosBms::on_zte_fb101_(const std::vector<uint8_t> &data) {
       this->publish_state_(this->cells_[i].cell_voltage_sensor_, v);
   }
 
-  float avg_v = (CELLS > 0) ? (sum_v / (float)CELLS : 0.0f);
+  float avg_v = (CELLS > 0) ? (sum_v / (float)CELLS : 0.0f;
   float total_v = sum_v;
 
   if (this->min_cell_voltage_sensor_ != nullptr) this->publish_state_(this->min_cell_voltage_sensor_, min_v);
