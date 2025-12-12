@@ -382,7 +382,7 @@ void SeplosBms::on_zte_fb100c1_(const std::vector<uint8_t> &data) {
   if (this->current_sensor_) this->publish_state_(this->current_sensor_, current);
 
   // FULL CAPACITY = SOH% × 1Ah
-  uint16_t soh_raw = zte_u16(54);
+  uint16_t soh_raw = u16(54);
   float soh = soh_raw / 100.0f;
   float full_cap = soh;   // langsung Ah
 
