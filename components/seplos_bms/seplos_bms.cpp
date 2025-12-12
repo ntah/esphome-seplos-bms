@@ -52,7 +52,7 @@ void SeplosBms::on_telemetry_data_(const std::vector<uint8_t> &data) {
 
   // ->
   // 0x2000460010960001100CD70CE90CF40CD60CEF0CE50CE10CDC0CE90CF00CE80CEF0CEA0CDA0CDE0CD8060BA60BA00B970BA60BA50BA2FD5C14A0344E0A426803134650004603E8149F0000000000000000
-  // 0x26004600307600011000000000000000000000000000000000000000000000000000000000000000000608530853085308530BAC0B9000000000002D0213880001E6B8
+  // 0x26004600307600011000000000000000000000000000000000000000000000000000000000000000000000000608530853085308530BAC0B9000000000002D0213880001E6B8
   //
   // *Data*
   //
@@ -173,7 +173,7 @@ void SeplosBms::on_telemetry_data_(const std::vector<uint8_t> &data) {
 }
 
 // ============================================================================
-// PATCHED: on_zte_fb101_
+// PATCHED: on_zte_fb101_  (UPDATED: dynamic offset parsing)
 // ============================================================================
 void SeplosBms::on_zte_fb101_(const std::vector<uint8_t> &data) {
   ESP_LOGI(TAG, "ZTE FB101 telemetry frame (%d bytes) received", (int)data.size());
@@ -199,7 +199,7 @@ void SeplosBms::on_zte_fb101_(const std::vector<uint8_t> &data) {
   const int TEMPS_ARRAY_LEN = static_cast<int>(sizeof(this->temperatures_) / sizeof(this->temperatures_[0]));
 
   // -----------------------
-  // CELLS (15 cells, offset 8, each 2 bytes, raw = mV)
+  // CELLS (15 cells expected, starting at index 8)
   // -----------------------
   const int CELL_COUNT = 15;
   float sum_v = 0.0f;
@@ -237,58 +237,56 @@ void SeplosBms::on_zte_fb101_(const std::vector<uint8_t> &data) {
   if (this->total_voltage_sensor_ != nullptr) this->publish_state_(this->total_voltage_sensor_, total_v);
 
   // -----------------------
-  // TEMPERATURES: data[38] = count, data[39..] = temp words (scaled 0.01 °C)
+  // Build dynamic offset (after cells)
   // -----------------------
-  if (data.size() > 39) {
-    uint8_t tcount = data[38];
-    for (int t = 0; t < 3 && t < (int)tcount; ++t) {
-      size_t tidx = 39 + t * 2;
-      if (tidx + 1 >= data.size()) break;
-      float t_raw = static_cast<float>(zte_u16(tidx));
-      float t_c = t_raw / 100.0f;
-      if (t < TEMPS_ARRAY_LEN && this->temperatures_[t].temperature_sensor_ != nullptr) {
-        this->publish_state_(this->temperatures_[t].temperature_sensor_, t_c);
-      }
-    }
+  size_t offset = 8 + (CELL_COUNT * 2);
+  if (offset >= data.size()) {
+    ESP_LOGW(TAG, "ZTE FB101: unexpected frame length after cell block (offset %d >= size %d)", (int)offset, (int)data.size());
+    return;
   }
 
   // -----------------------
-  // CURRENT (signed int16 from word 45-46). Empiric scale: /100 => Ampere
+  // TEMPERATURES: first byte = count, then count*2 bytes of words
   // -----------------------
-  int16_t cur_raw = static_cast<int16_t>(zte_u16(45));
+  uint8_t tcount = static_cast<uint8_t>(data[offset]);
+  ESP_LOGV(TAG, "ZTE FB101: temperature count=%d (offset=%d)", tcount, (int)offset);
+  for (int t = 0; t < (int)std::min((uint8_t)TEMPS_ARRAY_LEN, tcount); ++t) {
+    size_t tidx = offset + 1 + (t * 2);
+    if (tidx + 1 >= data.size()) break;
+    float t_raw = static_cast<float>(zte_u16(tidx));
+    // In FB101 temps appear to be scaled differently / empiric -> try existing mapping: (raw - 2731)*0.1f
+    float t_c = (t_raw - 2731.0f) * 0.1f;
+    if (this->temperatures_[t].temperature_sensor_ != nullptr) {
+      this->publish_state_(this->temperatures_[t].temperature_sensor_, t_c);
+    }
+  }
+  offset = offset + 1 + (tcount * 2);
+
+  // Ensure we have at least 2 bytes for current
+  if (offset + 1 >= data.size()) {
+    ESP_LOGW(TAG, "ZTE FB101: frame ended before current field (offset=%d, size=%d)", (int)offset, (int)data.size());
+    return;
+  }
+
+  // -----------------------
+  // CURRENT (signed int16)
+  // -----------------------
+  int16_t cur_raw = static_cast<int16_t>(zte_u16(offset));
   float current = cur_raw / 100.0f;
   if (this->current_sensor_ != nullptr) this->publish_state_(this->current_sensor_, current);
 
-  // FULL CAPACITY = SOH% × 1Ah
-  uint16_t soh_raw = zte_u16(54);
-  float soh = soh_raw / 100.0f;
-  float full_cap = soh;   // langsung Ah
-
-  if (this->battery_capacity_sensor_ != nullptr)
-    this->publish_state_(this->battery_capacity_sensor_, full_cap);
-
   // -----------------------
-  // SOH = full_cap / rated_capacity * 100
-  // (safe guard rated_capacity > 0)
+  // TOTAL VOLTAGE (next word)
   // -----------------------
-  if (this->state_of_health_sensor_ != nullptr) this->publish_state_(this->state_of_health_sensor_, soh);
+  if (offset + 3 < data.size()) {
+    float total_voltage2 = static_cast<float>(zte_u16(offset + 2)) * 0.01f;
+    if (this->total_voltage_sensor_ != nullptr) this->publish_state_(this->total_voltage_sensor_, total_voltage2);
+    total_v = total_voltage2;
+  }
 
   // -----------------------
-  // SOC (word 52-53) - scale 0.01% -> percent
+  // POWER calculations
   // -----------------------
-  float soc = zte_u16(52) / 100.0f;
-  if (this->state_of_charge_sensor_ != nullptr) this->publish_state_(this->state_of_charge_sensor_, soc);
-
-  // -----------------------
-  // RESIDUAL CAPACITY (Ah) computed from full_cap * SOC%
-  // -----------------------
-  float rem_cap = (full_cap > 0.0f) ? (full_cap * (soc / 100.0f)) : 0.0f;
-  if (this->residual_capacity_sensor_ != nullptr) this->publish_state_(this->residual_capacity_sensor_, rem_cap);
-
-  // -----------------------
-  // POWER calculations (use total_v; fallback to avg_v * CELL_COUNT)
-  // -----------------------
-  if (!std::isfinite(total_v) || total_v <= 0.0f) total_v = avg_v * (float)CELL_COUNT;
   float power = total_v * current;
   if (this->power_sensor_ != nullptr) this->publish_state_(this->power_sensor_, power);
 
@@ -303,12 +301,45 @@ void SeplosBms::on_zte_fb101_(const std::vector<uint8_t> &data) {
   }
 
   // -----------------------
-  // CYCLE count (word 55-56) - empirical mapping
+  // RESIDUAL CAPACITY / BATTERY CAPACITY / SOC / RATED CAP / CYCLES / SOH / PORT VOLTAGE
+  // Use relative offsets that match the usual ZTE layout, but guard bounds
   // -----------------------
-  uint16_t cycles_raw = zte_u16(56);
-  if (this->charging_cycles_sensor_ != nullptr) this->publish_state_(this->charging_cycles_sensor_, (float)cycles_raw);
+  if (offset + 4 < data.size()) {
+    float residual = static_cast<float>(zte_u16(offset + 4)) * 0.01f;
+    if (this->residual_capacity_sensor_ != nullptr) this->publish_state_(this->residual_capacity_sensor_, residual);
+  }
 
-  // done
+  if (offset + 7 < data.size()) {
+    float batt_cap = static_cast<float>(zte_u16(offset + 7)) * 0.01f;
+    if (this->battery_capacity_sensor_ != nullptr) this->publish_state_(this->battery_capacity_sensor_, batt_cap);
+  }
+
+  if (offset + 9 < data.size()) {
+    float soc = static_cast<float>(zte_u16(offset + 9)) * 0.1f;
+    if (this->state_of_charge_sensor_ != nullptr) this->publish_state_(this->state_of_charge_sensor_, soc);
+  }
+
+  if (offset + 11 < data.size()) {
+    float rated_cap = static_cast<float>(zte_u16(offset + 11)) * 0.01f;
+    if (this->rated_capacity_sensor_ != nullptr) this->publish_state_(this->rated_capacity_sensor_, rated_cap);
+  }
+
+  if (offset + 13 < data.size()) {
+    uint16_t cycles_raw = zte_u16(offset + 13);
+    if (this->charging_cycles_sensor_ != nullptr) this->publish_state_(this->charging_cycles_sensor_, (float)cycles_raw);
+  }
+
+  if (offset + 15 < data.size()) {
+    float soh = static_cast<float>(zte_u16(offset + 15)) * 0.1f;
+    if (this->state_of_health_sensor_ != nullptr) this->publish_state_(this->state_of_health_sensor_, soh);
+  }
+
+  if (offset + 17 < data.size()) {
+    float port_v = static_cast<float>(zte_u16(offset + 17)) * 0.01f;
+    if (this->port_voltage_sensor_ != nullptr) this->publish_state_(this->port_voltage_sensor_, port_v);
+  }
+
+  // Done
 }
 
 // ============================================================================
