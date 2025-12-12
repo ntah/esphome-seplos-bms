@@ -272,8 +272,8 @@ void SeplosBms::on_zte_fb101_(const std::vector<uint8_t> &data) {
   // SOH = full_cap / rated_capacity * 100
   // (safe guard rated_capacity > 0)
   // -----------------------
-  float soh = 0.0f;
-  if (rated_capacity > 0.0f) soh = (full_cap / rated_capacity) * 100.0f;
+  uint16_t soh_raw = zte_u16(54);
+  float soh = soh_raw / 100.0f;
   if (this->state_of_health_sensor_ != nullptr) this->publish_state_(this->state_of_health_sensor_, soh);
 
   // -----------------------
@@ -308,8 +308,8 @@ void SeplosBms::on_zte_fb101_(const std::vector<uint8_t> &data) {
   // -----------------------
   // CYCLE count (word 55-56) - empirical mapping
   // -----------------------
-  float cycles = zte_u16(55) / 202.0f; // tweak divisor if you want integer cycles
-  if (this->charging_cycles_sensor_ != nullptr) this->publish_state_(this->charging_cycles_sensor_, cycles);
+  uint16_t cycles_raw = zte_u16(56);
+  if (this->charging_cycles_sensor_ != nullptr) this->publish_state_(this->charging_cycles_sensor_, (float)cycles_raw);
 
   // done
 }
