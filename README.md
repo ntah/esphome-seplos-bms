@@ -1,3 +1,224 @@
+base : https://github.com/syssi/esphome-seplos-bms/.
+Tujuannya hanya agar bisa membaca bms zte zxdc48 fb101, zte zxdc48 fb100c1 dan Shoto mcb. saya hanya memiliki bms tersebut jadi hanya itu yang bisa saya test.
+
+![alt text](https://github.com/ntah/esphome-seplos-bms/blob/main/images/Screenshotwirring.png?raw=true)
+```yaml
+esphome:
+  name: zte-bms
+  friendly_name: zte-bms
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf  
+
+# Enable logging
+logger:
+  baud_rate: 0
+  level: NONE
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "key="
+
+ota:
+  - platform: esphome
+    password: "your default ota password"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Zte-Bms Fallback Hotspot"
+    password: "passwprd"
+
+captive_portal:
+
+external_components:
+  - source: github://ntah/esphome-seplos-bms@main
+    refresh: 0s
+
+uart:
+  id: uart_bus1
+  baud_rate: 9600
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  rx_timeout: 50
+  rx_buffer_size: 512  
+  # The increased RX buffer size is important because
+  # the full BMS response must fit into the buffer
+  debug:
+    direction: BOTH
+    dummy_receiver: false
+    after:
+      delimiter: "\r"
+    sequence:
+      - lambda: UARTDebug::log_string(direction, bytes);
+
+seplos_modbus:
+  id: modbus0
+  uart_id: uart_bus1
+  rx_timeout: 500ms
+  flow_control_pin: GPIO4
+
+seplos_bms:
+  - id: battery_bank1
+    address: 0x02
+    seplos_modbus_id: modbus0
+    protocol_version: 0x21
+    update_interval: 10s
+    tipe: fb101 #ganti dengan fb101 atau fb100c1 atau shotomcb
+
+  - id: battery_bank2
+    address: 0x03
+    protocol_version: 0x21
+    seplos_modbus_id: modbus0
+    update_interval: 10s  
+    tipe: fb100c1  #ganti dengan fb101 atau fb100c1 atau shotomcb
+
+sensor:
+  - platform: seplos_bms
+    seplos_bms_id: battery_bank1
+    charging_cycles:
+      name: "bank 1 charging cycles"    
+    min_cell_voltage:
+      name: "bank 1 min cell voltage"
+    max_cell_voltage:
+      name: "bank 1 max cell voltage"
+    delta_cell_voltage:
+      name: "bank 1 delta cell voltage"
+    average_cell_voltage:
+      name: "bank 1 average cell voltage"
+    cell_voltage_1:
+      name: "bank 1 cell voltage 1"
+    cell_voltage_2:
+      name: "bank 1 cell voltage 2"
+    cell_voltage_3:
+      name: "bank 1 cell voltage 3"
+    cell_voltage_4:
+      name: "bank 1 cell voltage 4"
+    cell_voltage_5:
+      name: "bank 1 cell voltage 5"
+    cell_voltage_6:
+      name: "bank 1 cell voltage 6"
+    cell_voltage_7:
+      name: "bank 1 cell voltage 7"
+    cell_voltage_8:
+      name: "bank 1 cell voltage 8"
+    cell_voltage_9:
+      name: "bank 1 cell voltage 9"
+    cell_voltage_10:
+      name: "bank 1 cell voltage 10"
+    cell_voltage_11:
+      name: "bank 1 cell voltage 11"
+    cell_voltage_12:
+      name: "bank 1 cell voltage 12"
+    cell_voltage_13:
+      name: "bank 1 cell voltage 13"
+    cell_voltage_14:
+      name: "bank 1 cell voltage 14"
+    cell_voltage_15:
+      name: "bank 1 cell voltage 15"
+    state_of_health:
+      name: "bank 1 SOH"
+    state_of_charge:
+      name: "bank 1 SOC"
+    total_voltage:
+      id: bank1_total_voltage
+      name: "bank 1 total voltage"
+    current:
+      name: "bank 1 current"
+    power:
+      name: "bank 1 power"
+    charging_power:
+      name: "bank 1 charging power"
+    discharging_power:
+      name: "bank 1 discharging power"    
+    battery_capacity:
+      id: bank1_battery_capacity
+      name: "bank 1 battery capacity"   
+    temperature_1:
+      id: bank1_temperature_1
+    temperature_2:
+      id: bank1_temperature_2
+    temperature_3:
+      id: bank1_temperature_3
+    residual_capacity:
+      id: bank1_residual_capacity      
+
+  - platform: seplos_bms
+    seplos_bms_id: battery_bank2
+    charging_cycles:
+      name: "bank 2 charging cycles"    
+    min_cell_voltage:
+      name: "bank 2 min cell voltage"
+    max_cell_voltage:
+      name: "bank 2 max cell voltage"
+    delta_cell_voltage:
+      name: "bank 2 delta cell voltage"
+    average_cell_voltage:
+      name: "bank 2 average cell voltage"
+    cell_voltage_1:
+      name: "bank 2 cell voltage 1"
+    cell_voltage_2:
+      name: "bank 2 cell voltage 2"
+    cell_voltage_3:
+      name: "bank 2 cell voltage 3"
+    cell_voltage_4:
+      name: "bank 2 cell voltage 4"
+    cell_voltage_5:
+      name: "bank 2 cell voltage 5"
+    cell_voltage_6:
+      name: "bank 2 cell voltage 6"
+    cell_voltage_7:
+      name: "bank 2 cell voltage 7"
+    cell_voltage_8:
+      name: "bank 2 cell voltage 8"
+    cell_voltage_9:
+      name: "bank 2 cell voltage 9"
+    cell_voltage_10:
+      name: "bank 2 cell voltage 10"
+    cell_voltage_11:
+      name: "bank 2 cell voltage 11"
+    cell_voltage_12:
+      name: "bank 2 cell voltage 12"
+    cell_voltage_13:
+      name: "bank 2 cell voltage 13"
+    cell_voltage_14:
+      name: "bank 2 cell voltage 14"
+    cell_voltage_15:
+      name: "bank 2 cell voltage 15"
+    state_of_health:
+      name: "bank 2 SOH"
+    state_of_charge:
+      name: "bank 2 SOC"
+    total_voltage:
+      id: bank2_total_voltage
+      name: "bank 2 total voltage"
+    current:
+      name: "bank 2 current"
+    power:
+      name: "bank 2 power"
+    charging_power:
+      name: "bank 2 charging power"
+    discharging_power:
+      name: "bank 2 discharging power"     
+    battery_capacity:
+      id: bank2_battery_capacity
+      name: "bank 2 battery capacity"         
+    temperature_1:
+      id: bank2_temperature_1
+    temperature_2:
+      id: bank2_temperature_2
+    temperature_3:
+      id: bank2_temperature_3
+    residual_capacity:
+      id: bank2_residual_capacity
+      name: "bank 2 residual capacity"  
+```
 # esphome-seplos-bms
 
 ESPHome component to monitor a Seplos BMS via UART, RS485 or BLE
